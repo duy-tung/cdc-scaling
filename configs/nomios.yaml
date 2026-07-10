@@ -1,0 +1,33 @@
+# Example Nomios node configuration: one hyperloop capturing the catalog
+# database. Environment variables in ${...} are expanded at load time.
+listen: ":8080"
+
+hyperloops:
+  - id: catalog-main
+    source:
+      mysql:
+        host: mysql-replica-1
+        port: 3306
+        user: nomios
+        password: ${NOMIOS_MYSQL_PASSWORD}
+        serverID: 5501 # must be unique per replica client on the server
+        gtid: true
+        include: ["catalog.deals", "catalog.products", "catalog.*_price"]
+        exclude: ["catalog.tmp_*"]
+    pipeline:
+      queues: 8 # buffer queues == publishers in the pool
+      queueCapacity: 4096
+      batch: { maxSize: 500, maxWaitMs: 20 }
+      keyOverrides:
+        catalog.deals: ["seller_id", "deal_id"]
+    sink:
+      kafka:
+        brokers: ["kafka-1:9092", "kafka-2:9092"]
+        topicTemplate: "cdc.{database}.{table}"
+        compression: lz4
+        allowAutoTopicCreation: false
+    state:
+      store: mysql # persisted in the source database by default
+      database: nomios
+      commitIntervalMs: 1000
+    shutdownTimeoutSec: 30

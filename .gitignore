@@ -1,0 +1,6 @@
+/nomios
+/bin/
+*.test
+*.out
+.idea/
+.vscode/

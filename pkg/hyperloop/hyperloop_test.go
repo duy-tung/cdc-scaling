@@ -20,12 +20,26 @@ type fakeSource struct {
 	blockAtEnd bool
 }
 
-func (s *fakeSource) Start(ctx context.Context, _ state.Position, out chan<- *event.NomiosEvent) error {
+func (s *fakeSource) Start(ctx context.Context, _ state.Position, out chan<- []*event.NomiosEvent) error {
+	const microBatch = 64
 	perKey := map[string]int{}
+	batch := make([]*event.NomiosEvent, 0, microBatch)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		select {
+		case out <- batch:
+			batch = make([]*event.NomiosEvent, 0, microBatch)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for i := 1; i <= s.n; i++ {
 		key := fmt.Sprintf("db.t|%d", i%s.keys)
 		perKey[key]++
-		e := &event.NomiosEvent{
+		batch = append(batch, &event.NomiosEvent{
 			ID:  fmt.Sprintf("e%d", i),
 			Op:  event.OpInsert,
 			Key: key,
@@ -35,12 +49,15 @@ func (s *fakeSource) Start(ctx context.Context, _ state.Position, out chan<- *ev
 			},
 			Source:   event.SourceMeta{Connector: "fake", Database: "db", Table: "t"},
 			Position: state.Position{SeqNo: uint64(i), File: "fake", Offset: uint32(i)},
+		})
+		if len(batch) == microBatch {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
-		select {
-		case out <- e:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	}
+	if err := flush(); err != nil {
+		return err
 	}
 	if s.blockAtEnd {
 		<-ctx.Done()
@@ -211,21 +228,40 @@ func TestHyperloopSinkFailureAborts(t *testing.T) {
 }
 
 func TestDrainBatchRespectsMaxAndClose(t *testing.T) {
-	q := make(chan *event.NomiosEvent, 10)
-	for i := 0; i < 10; i++ {
-		q <- &event.NomiosEvent{Key: dispatch.KeyFromColumns("t", map[string]any{"i": i}, nil)}
+	mk := func(n int) []*event.NomiosEvent {
+		out := make([]*event.NomiosEvent, n)
+		for i := range out {
+			out[i] = &event.NomiosEvent{Key: dispatch.KeyFromColumns("t", map[string]any{"i": i}, nil)}
+		}
+		return out
 	}
-	batch, open := drainBatch(context.Background(), q, 4, 50*time.Millisecond)
-	if len(batch) != 4 || !open {
-		t.Fatalf("batch=%d open=%v, want 4,true", len(batch), open)
+	q := make(chan []*event.NomiosEvent, 10)
+	q <- mk(3)
+	q <- mk(3)
+	q <- mk(4)
+
+	// maxSize=4: first micro-batch (3) is under, second tops it to 6 —
+	// drain may exceed maxSize by up to one micro-batch.
+	batch, open := drainBatch(context.Background(), q, nil, 4, 50*time.Millisecond)
+	if len(batch) != 6 || !open {
+		t.Fatalf("batch=%d open=%v, want 6,true", len(batch), open)
 	}
 	close(q)
-	batch, open = drainBatch(context.Background(), q, 100, 50*time.Millisecond)
-	if len(batch) != 6 || open {
-		t.Fatalf("batch=%d open=%v, want 6,false", len(batch), open)
+	batch, open = drainBatch(context.Background(), q, nil, 100, 50*time.Millisecond)
+	if len(batch) != 4 || open {
+		t.Fatalf("batch=%d open=%v, want 4,false", len(batch), open)
 	}
-	batch, open = drainBatch(context.Background(), q, 100, 50*time.Millisecond)
+	batch, open = drainBatch(context.Background(), q, nil, 100, 50*time.Millisecond)
 	if len(batch) != 0 || open {
 		t.Fatalf("batch=%d open=%v, want 0,false", len(batch), open)
+	}
+
+	// The caller's buffer is reused: same backing array when capacity fits.
+	buf := make([]*event.NomiosEvent, 0, 8)
+	q2 := make(chan []*event.NomiosEvent, 1)
+	q2 <- mk(2)
+	batch, _ = drainBatch(context.Background(), q2, buf, 2, time.Millisecond)
+	if len(batch) != 2 || cap(batch) != cap(buf) {
+		t.Fatalf("buffer not reused: len=%d cap=%d want cap=%d", len(batch), cap(batch), cap(buf))
 	}
 }

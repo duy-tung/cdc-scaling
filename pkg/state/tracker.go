@@ -28,6 +28,28 @@ func (t *Tracker) Done(p Position) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.pending[p.SeqNo] = p
+	t.advance()
+}
+
+// DoneBatch records a whole batch of published positions under a single
+// lock acquisition. Publishers complete events in batches; reporting them
+// one Done at a time made the tracker mutex a measurable share of pipeline
+// CPU (~5% cum).
+func (t *Tracker) DoneBatch(ps []Position) {
+	if len(ps) == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, p := range ps {
+		t.pending[p.SeqNo] = p
+	}
+	t.advance()
+}
+
+// advance moves the checkpoint across the contiguous completed prefix.
+// Callers must hold t.mu.
+func (t *Tracker) advance() {
 	for {
 		q, ok := t.pending[t.next]
 		if !ok {

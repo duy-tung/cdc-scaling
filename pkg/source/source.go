@@ -21,7 +21,13 @@ type Source interface {
 	// the stream; it must return promptly (nil or ctx.Err) once ctx is
 	// cancelled. Start must NOT close out — the caller owns the channel.
 	//
+	// Events are sent in micro-batches: the natural unit the source reads
+	// (e.g. all rows of one binlog RowsEvent). Batching the channel hop
+	// amortizes scheduler and select overhead, which profiling showed at
+	// ~25% of pipeline CPU when events crossed one at a time. A batch is
+	// owned by the receiver once sent.
+	//
 	// SeqNos on emitted events must start at 1 and be contiguous within one
 	// Start call.
-	Start(ctx context.Context, from state.Position, out chan<- *event.NomiosEvent) error
+	Start(ctx context.Context, from state.Position, out chan<- []*event.NomiosEvent) error
 }

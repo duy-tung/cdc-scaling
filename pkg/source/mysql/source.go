@@ -78,7 +78,7 @@ func New(cfg Config, logger *slog.Logger) *Source {
 }
 
 // Start implements source.Source.
-func (s *Source) Start(ctx context.Context, from state.Position, out chan<- *event.NomiosEvent) error {
+func (s *Source) Start(ctx context.Context, from state.Position, out chan<- []*event.NomiosEvent) error {
 	registry, err := newSchemaRegistry(s.cfg.addr(), s.cfg.User, s.cfg.Password)
 	if err != nil {
 		return err
@@ -192,7 +192,7 @@ type txnState struct {
 	txOrder     int
 }
 
-func (s *Source) run(ctx context.Context, streamer *replication.BinlogStreamer, registry *schemaRegistry, start startPoint, out chan<- *event.NomiosEvent) error {
+func (s *Source) run(ctx context.Context, streamer *replication.BinlogStreamer, registry *schemaRegistry, start startPoint, out chan<- []*event.NomiosEvent) error {
 	ts := &txnState{
 		committedFile: start.file,
 		committedPos:  start.offset,
@@ -220,7 +220,7 @@ func (s *Source) run(ctx context.Context, streamer *replication.BinlogStreamer, 
 	}
 }
 
-func (s *Source) handleEvent(ctx context.Context, ev *replication.BinlogEvent, ts *txnState, registry *schemaRegistry, out chan<- *event.NomiosEvent) error {
+func (s *Source) handleEvent(ctx context.Context, ev *replication.BinlogEvent, ts *txnState, registry *schemaRegistry, out chan<- []*event.NomiosEvent) error {
 	switch e := ev.Event.(type) {
 	case *replication.RotateEvent:
 		ts.currentFile = string(e.NextLogName)
@@ -266,7 +266,7 @@ func (ts *txnState) commit(logPos uint32) {
 	ts.committedPos = logPos
 }
 
-func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *replication.RowsEvent, op event.Op, ts *txnState, registry *schemaRegistry, out chan<- *event.NomiosEvent) error {
+func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *replication.RowsEvent, op event.Op, ts *txnState, registry *schemaRegistry, out chan<- []*event.NomiosEvent) error {
 	db, table := string(re.Table.Schema), string(re.Table.Table)
 	fqtn := db + "." + table
 	if !s.filter.match(fqtn) {
@@ -290,6 +290,9 @@ func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *
 	if op == event.OpUpdate {
 		step = 2 // update rows come in (before, after) pairs
 	}
+	// All rows of one binlog event travel as one micro-batch: a single
+	// channel send instead of one per row.
+	batch := make([]*event.NomiosEvent, 0, len(re.Rows)/step)
 	for i := 0; i+step-1 < len(re.Rows); i += step {
 		var before, after map[string]any
 		switch op {
@@ -329,14 +332,17 @@ func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *
 		}
 		row := ne.Row()
 		ne.Key = dispatch.KeyFromColumns(fqtn, row, schema.PK)
-
-		select {
-		case out <- ne:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		batch = append(batch, ne)
 	}
-	return nil
+	if len(batch) == 0 {
+		return nil
+	}
+	select {
+	case out <- batch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // mapRow maps positional binlog values to named columns, normalizing

@@ -11,9 +11,8 @@ package dispatch
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
 	"sort"
-	"strings"
+	"strconv"
 
 	"github.com/duy-tung/cdc-scaling/pkg/event"
 )
@@ -28,14 +27,11 @@ type KeyFunc func(e *event.NomiosEvent) string
 // events through a single queue — slow but always correct.
 func DefaultKey(overrides map[string][]string) KeyFunc {
 	return func(e *event.NomiosEvent) string {
-		if cols, ok := overrides[e.Source.FQTN()]; ok {
-			row := e.Row()
-			parts := make([]string, 0, len(cols)+1)
-			parts = append(parts, e.Source.FQTN())
-			for _, c := range cols {
-				parts = append(parts, fmt.Sprintf("%v", row[c]))
+		if len(overrides) > 0 {
+			fqtn := e.Source.FQTN()
+			if cols, ok := overrides[fqtn]; ok {
+				return KeyFromColumns(fqtn, e.Row(), cols)
 			}
-			return strings.Join(parts, "|")
 		}
 		if e.Key != "" {
 			return e.Key
@@ -47,8 +43,6 @@ func DefaultKey(overrides map[string][]string) KeyFunc {
 // KeyFromColumns builds a stable key string from named columns of a row.
 // Exported for sources to build the default primary-key based key.
 func KeyFromColumns(fqtn string, row map[string]any, cols []string) string {
-	parts := make([]string, 0, len(cols)+1)
-	parts = append(parts, fqtn)
 	if len(cols) == 0 {
 		// No usable key columns: fall back to the whole row, sorted, so
 		// identical rows at least hash consistently.
@@ -59,46 +53,120 @@ func KeyFromColumns(fqtn string, row map[string]any, cols []string) string {
 		sort.Strings(names)
 		cols = names
 	}
+	b := make([]byte, 0, len(fqtn)+16*len(cols))
+	b = append(b, fqtn...)
 	for _, c := range cols {
-		parts = append(parts, fmt.Sprintf("%v", row[c]))
+		b = append(b, '|')
+		b = appendKeyValue(b, row[c])
 	}
-	return strings.Join(parts, "|")
+	return string(b)
+}
+
+// appendKeyValue renders a column value into a key without fmt reflection
+// (fmt.Sprintf was 6.6% of pipeline allocations). The rendering only needs
+// to be deterministic and collision-free per column, not human-canonical.
+func appendKeyValue(b []byte, v any) []byte {
+	switch x := v.(type) {
+	case nil:
+		return b
+	case string:
+		return append(b, x...)
+	case []byte:
+		return append(b, x...)
+	case int:
+		return strconv.AppendInt(b, int64(x), 10)
+	case int8:
+		return strconv.AppendInt(b, int64(x), 10)
+	case int16:
+		return strconv.AppendInt(b, int64(x), 10)
+	case int32:
+		return strconv.AppendInt(b, int64(x), 10)
+	case int64:
+		return strconv.AppendInt(b, x, 10)
+	case uint:
+		return strconv.AppendUint(b, uint64(x), 10)
+	case uint8:
+		return strconv.AppendUint(b, uint64(x), 10)
+	case uint16:
+		return strconv.AppendUint(b, uint64(x), 10)
+	case uint32:
+		return strconv.AppendUint(b, uint64(x), 10)
+	case uint64:
+		return strconv.AppendUint(b, x, 10)
+	case bool:
+		return strconv.AppendBool(b, x)
+	case float32:
+		return strconv.AppendFloat(b, float64(x), 'g', -1, 32)
+	case float64:
+		return strconv.AppendFloat(b, x, 'g', -1, 64)
+	default:
+		return fmt.Appendf(b, "%v", v)
+	}
 }
 
 // Dispatcher routes events from the source stream into N buffer queues.
+//
+// Events travel through the queues as micro-batches ([]*NomiosEvent): the
+// dispatcher stages routed events per queue and flushes a queue's staging
+// slice when it reaches flushSize, when the input pauses, or on shutdown.
+// This amortizes channel/select overhead (~25% of pipeline CPU when events
+// crossed channels one at a time) without adding latency under load.
 type Dispatcher struct {
-	queues []chan *event.NomiosEvent
-	key    KeyFunc
+	queues    []chan []*event.NomiosEvent
+	staging   [][]*event.NomiosEvent
+	key       KeyFunc
+	flushSize int
 }
 
-// New creates a dispatcher with n buffer queues of the given capacity.
-func New(n, capacity int, key KeyFunc) *Dispatcher {
+// New creates a dispatcher with n buffer queues. eventCapacity is the
+// approximate number of events (not batches) a queue buffers before the
+// dispatcher — and transitively the source — blocks; flushSize is the max
+// micro-batch size staged per queue.
+func New(n, eventCapacity, flushSize int, key KeyFunc) *Dispatcher {
 	if n < 1 {
 		n = 1
 	}
-	qs := make([]chan *event.NomiosEvent, n)
-	for i := range qs {
-		qs[i] = make(chan *event.NomiosEvent, capacity)
+	if flushSize < 1 {
+		flushSize = 256
 	}
-	return &Dispatcher{queues: qs, key: key}
+	batches := eventCapacity / flushSize
+	if batches < 2 {
+		batches = 2
+	}
+	d := &Dispatcher{
+		queues:    make([]chan []*event.NomiosEvent, n),
+		staging:   make([][]*event.NomiosEvent, n),
+		key:       key,
+		flushSize: flushSize,
+	}
+	for i := range d.queues {
+		d.queues[i] = make(chan []*event.NomiosEvent, batches)
+		d.staging[i] = make([]*event.NomiosEvent, 0, flushSize)
+	}
+	return d
 }
 
 // Queues exposes the buffer queues for the consumer pool to drain.
-func (d *Dispatcher) Queues() []chan *event.NomiosEvent { return d.queues }
+func (d *Dispatcher) Queues() []chan []*event.NomiosEvent { return d.queues }
 
-// Pick returns the queue index for an event.
+// Pick returns the queue index for an event. The hash is an inlined
+// FNV-1a over the key string (identical results to hash/fnv, without the
+// hasher object and []byte conversion allocations).
 func (d *Dispatcher) Pick(e *event.NomiosEvent) int {
 	k := d.key(e)
 	e.Key = k // ensure the exact routed key is also the Kafka record key
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(k))
-	return int(h.Sum32() % uint32(len(d.queues)))
+	h := uint32(2166136261)
+	for i := 0; i < len(k); i++ {
+		h = (h ^ uint32(k[i])) * 16777619
+	}
+	return int(h % uint32(len(d.queues)))
 }
 
-// Run consumes events from in until it is closed or ctx is cancelled,
-// routing each event to its queue (blocking when the queue is full). On
-// return it closes all queues so downstream publishers drain and exit.
-func (d *Dispatcher) Run(ctx context.Context, in <-chan *event.NomiosEvent) error {
+// Run consumes event batches from in until it is closed or ctx is
+// cancelled, routing each event to its queue (blocking when the queue is
+// full). On return it flushes staged events and closes all queues so
+// downstream publishers drain and exit.
+func (d *Dispatcher) Run(ctx context.Context, in <-chan []*event.NomiosEvent) error {
 	defer func() {
 		for _, q := range d.queues {
 			close(q)
@@ -106,14 +174,24 @@ func (d *Dispatcher) Run(ctx context.Context, in <-chan *event.NomiosEvent) erro
 	}()
 	for {
 		select {
-		case e, ok := <-in:
+		case batch, ok := <-in:
 			if !ok {
-				return nil
+				return d.flushAll(ctx)
 			}
-			select {
-			case d.queues[d.Pick(e)] <- e:
-			case <-ctx.Done():
-				return ctx.Err()
+			for _, e := range batch {
+				i := d.Pick(e)
+				d.staging[i] = append(d.staging[i], e)
+				if len(d.staging[i]) >= d.flushSize {
+					if err := d.flush(ctx, i); err != nil {
+						return err
+					}
+				}
+			}
+			// Input momentarily idle: don't sit on staged events.
+			if len(in) == 0 {
+				if err := d.flushAll(ctx); err != nil {
+					return err
+				}
 			}
 		case <-ctx.Done():
 			return ctx.Err()
@@ -121,11 +199,36 @@ func (d *Dispatcher) Run(ctx context.Context, in <-chan *event.NomiosEvent) erro
 	}
 }
 
-// Depths returns the current number of buffered events per queue.
+func (d *Dispatcher) flush(ctx context.Context, i int) error {
+	if len(d.staging[i]) == 0 {
+		return nil
+	}
+	select {
+	case d.queues[i] <- d.staging[i]:
+		d.staging[i] = make([]*event.NomiosEvent, 0, d.flushSize)
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *Dispatcher) flushAll(ctx context.Context) error {
+	for i := range d.queues {
+		if err := d.flush(ctx, i); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Depths returns the approximate number of buffered events per queue
+// (buffered batches × flush size). Staged-but-unflushed events are not
+// counted: staging is owned by the Run goroutine and Depths is called
+// concurrently from the status endpoint.
 func (d *Dispatcher) Depths() []int {
 	out := make([]int, len(d.queues))
 	for i, q := range d.queues {
-		out[i] = len(q)
+		out[i] = len(q) * d.flushSize
 	}
 	return out
 }

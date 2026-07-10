@@ -176,10 +176,20 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	tracker := state.NewTracker()
 	h.tracker.Store(tracker)
 
-	d := dispatch.New(h.cfg.Queues, h.cfg.QueueCapacity, dispatch.DefaultKey(h.cfg.KeyOverrides))
+	// Micro-batch size for the channel hops: bounded by the publisher batch
+	// so one queue batch never overshoots a publish batch by much.
+	flushSize := h.cfg.BatchMaxSize
+	if flushSize > 256 {
+		flushSize = 256
+	}
+	d := dispatch.New(h.cfg.Queues, h.cfg.QueueCapacity, flushSize, dispatch.DefaultKey(h.cfg.KeyOverrides))
 	h.dispatcher.Store(d)
 
-	out := make(chan *event.NomiosEvent, h.cfg.QueueCapacity)
+	outBatches := h.cfg.QueueCapacity / flushSize
+	if outBatches < 2 {
+		outBatches = 2
+	}
+	out := make(chan []*event.NomiosEvent, outBatches)
 
 	// Two cancellation levels: srcCtx stops the source first (graceful —
 	// the rest of the pipeline drains naturally when the stream closes);
@@ -228,7 +238,7 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	// Publisher pool: one worker per buffer queue.
 	for i, q := range d.Queues() {
 		wg.Add(1)
-		go func(i int, q <-chan *event.NomiosEvent) {
+		go func(i int, q <-chan []*event.NomiosEvent) {
 			defer wg.Done()
 			if err := h.runPublisher(hardCtx, i, q, tracker); err != nil {
 				fail(fmt.Errorf("publisher %d: %w", i, err))
@@ -289,10 +299,14 @@ func (h *Hyperloop) run(ctx context.Context) error {
 }
 
 // runPublisher drains one buffer queue in batches, publishes each batch to
-// the sink, and reports completed positions to the tracker.
-func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan *event.NomiosEvent, tracker *state.Tracker) error {
+// the sink, and reports completed positions to the tracker. The batch
+// buffer is reused across iterations; the Sink contract is that it may
+// retain events but not the batch slice itself.
+func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan []*event.NomiosEvent, tracker *state.Tracker) error {
+	positions := make([]state.Position, 0, h.cfg.BatchMaxSize)
+	buf := make([]*event.NomiosEvent, 0, h.cfg.BatchMaxSize)
 	for {
-		batch, open := drainBatch(ctx, q, h.cfg.BatchMaxSize, h.cfg.BatchMaxWait)
+		batch, open := drainBatch(ctx, q, buf, h.cfg.BatchMaxSize, h.cfg.BatchMaxWait)
 		if len(batch) > 0 {
 			if err := h.deps.Sink.PublishBatch(ctx, batch); err != nil {
 				if ctx.Err() != nil {
@@ -300,9 +314,11 @@ func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan *event.No
 				}
 				return err
 			}
+			positions = positions[:0]
 			for _, e := range batch {
-				tracker.Done(e.Position)
+				positions = append(positions, e.Position)
 			}
+			tracker.DoneBatch(positions)
 			h.published.Add(uint64(len(batch)))
 		}
 		if !open {
@@ -311,29 +327,33 @@ func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan *event.No
 	}
 }
 
-// drainBatch blocks for the first event, then tops the batch up until
-// maxSize events are collected, maxWait elapses, or the queue closes.
-// open=false means the queue is closed and fully drained (or ctx died).
-func drainBatch(ctx context.Context, q <-chan *event.NomiosEvent, maxSize int, maxWait time.Duration) (batch []*event.NomiosEvent, open bool) {
+// drainBatch blocks for the first micro-batch, then tops the batch up
+// until at least maxSize events are collected, maxWait elapses, or the
+// queue closes. Collected micro-batches are flattened into buf (reused by
+// the caller). open=false means the queue is closed and fully drained (or
+// ctx died). The returned batch may exceed maxSize by up to one
+// micro-batch.
+func drainBatch(ctx context.Context, q <-chan []*event.NomiosEvent, buf []*event.NomiosEvent, maxSize int, maxWait time.Duration) (batch []*event.NomiosEvent, open bool) {
+	batch = buf[:0]
 	select {
-	case e, ok := <-q:
+	case bs, ok := <-q:
 		if !ok {
-			return nil, false
+			return batch, false
 		}
-		batch = append(batch, e)
+		batch = append(batch, bs...)
 	case <-ctx.Done():
-		return nil, false
+		return batch, false
 	}
 
 	timer := time.NewTimer(maxWait)
 	defer timer.Stop()
 	for len(batch) < maxSize {
 		select {
-		case e, ok := <-q:
+		case bs, ok := <-q:
 			if !ok {
 				return batch, false
 			}
-			batch = append(batch, e)
+			batch = append(batch, bs...)
 		case <-timer.C:
 			return batch, true
 		case <-ctx.Done():

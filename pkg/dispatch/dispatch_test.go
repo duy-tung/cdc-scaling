@@ -17,7 +17,7 @@ func ev(db, table, key string) *event.NomiosEvent {
 }
 
 func TestPickStableForSameKey(t *testing.T) {
-	d := New(8, 16, DefaultKey(nil))
+	d := New(8, 1024, 64, DefaultKey(nil))
 	first := d.Pick(ev("db", "t", "db.t|1"))
 	for i := 0; i < 100; i++ {
 		if got := d.Pick(ev("db", "t", "db.t|1")); got != first {
@@ -27,7 +27,7 @@ func TestPickStableForSameKey(t *testing.T) {
 }
 
 func TestPickSpreadsKeys(t *testing.T) {
-	d := New(8, 16, DefaultKey(nil))
+	d := New(8, 1024, 64, DefaultKey(nil))
 	seen := map[int]bool{}
 	for i := 0; i < 1000; i++ {
 		seen[d.Pick(ev("db", "t", fmt.Sprintf("db.t|%d", i)))] = true
@@ -53,17 +53,25 @@ func TestKeyOverrides(t *testing.T) {
 func TestRunRoutesAndCloses(t *testing.T) {
 	// Queues are not drained until Run finishes, so capacity must hold all
 	// events routed to any one queue.
-	d := New(4, 128, DefaultKey(nil))
-	in := make(chan *event.NomiosEvent)
+	d := New(4, 512, 8, DefaultKey(nil))
+	in := make(chan []*event.NomiosEvent, 4)
 	done := make(chan error, 1)
 	go func() { done <- d.Run(context.Background(), in) }()
 
 	byQueue := map[int][]string{}
+	var batch []*event.NomiosEvent
 	for i := 0; i < 100; i++ {
 		k := fmt.Sprintf("db.t|%d", i%10)
 		e := ev("db", "t", k)
 		byQueue[d.Pick(e)] = append(byQueue[d.Pick(e)], k)
-		in <- e
+		batch = append(batch, e)
+		if len(batch) == 7 { // deliberately not aligned with flushSize
+			in <- batch
+			batch = nil
+		}
+	}
+	if len(batch) > 0 {
+		in <- batch
 	}
 	close(in)
 	if err := <-done; err != nil {
@@ -74,8 +82,10 @@ func TestRunRoutesAndCloses(t *testing.T) {
 	total := 0
 	for i, q := range d.Queues() {
 		var got []string
-		for e := range q { // range ends only if closed
-			got = append(got, e.Key)
+		for bs := range q { // range ends only if closed
+			for _, e := range bs {
+				got = append(got, e.Key)
+			}
 		}
 		total += len(got)
 		want := byQueue[i]

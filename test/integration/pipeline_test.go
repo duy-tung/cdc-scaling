@@ -20,12 +20,26 @@ type genSource struct {
 	n, keys int
 }
 
-func (s *genSource) Start(ctx context.Context, _ state.Position, out chan<- *event.NomiosEvent) error {
+func (s *genSource) Start(ctx context.Context, _ state.Position, out chan<- []*event.NomiosEvent) error {
+	const microBatch = 64
 	perKey := map[int]int{}
+	batch := make([]*event.NomiosEvent, 0, microBatch)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		select {
+		case out <- batch:
+			batch = make([]*event.NomiosEvent, 0, microBatch)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for i := 1; i <= s.n; i++ {
 		k := i % s.keys
 		perKey[k]++
-		e := &event.NomiosEvent{
+		batch = append(batch, &event.NomiosEvent{
 			ID:  fmt.Sprintf("gen:%d", i),
 			Op:  event.OpInsert,
 			Key: fmt.Sprintf("gen.items|%d", k),
@@ -36,14 +50,14 @@ func (s *genSource) Start(ctx context.Context, _ state.Position, out chan<- *eve
 			Source:     event.SourceMeta{Connector: "gen", Database: "gen", Table: "items"},
 			OccurredAt: time.Now(),
 			Position:   state.Position{SeqNo: uint64(i), File: "gen", Offset: uint32(i)},
-		}
-		select {
-		case out <- e:
-		case <-ctx.Done():
-			return ctx.Err()
+		})
+		if len(batch) == microBatch {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
-	return nil
+	return flush()
 }
 
 // TestPipelineToKafka runs the full hyperloop (dispatcher, publisher pool,
@@ -124,7 +138,7 @@ type positionRecorder struct {
 	got chan state.Position
 }
 
-func (s *positionRecorder) Start(ctx context.Context, from state.Position, out chan<- *event.NomiosEvent) error {
+func (s *positionRecorder) Start(ctx context.Context, from state.Position, out chan<- []*event.NomiosEvent) error {
 	s.got <- from
 	return s.genSource.Start(ctx, from, out)
 }

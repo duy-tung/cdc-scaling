@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -44,7 +45,15 @@ type Sink struct {
 	cl  *kgo.Client
 	ser serialize.Serializer
 	cfg Config
+
+	// topics caches resolved topic names per table so the hot path does no
+	// template substitution (strings.NewReplacer per event showed up in
+	// allocation profiles).
+	topicMu sync.RWMutex
+	topics  map[tableKey]string
 }
+
+type tableKey struct{ db, table string }
 
 func New(cfg Config, ser serialize.Serializer) (*Sink, error) {
 	cfg.withDefaults()
@@ -73,16 +82,26 @@ func New(cfg Config, ser serialize.Serializer) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kafka: client: %w", err)
 	}
-	return &Sink{cl: cl, ser: ser, cfg: cfg}, nil
+	return &Sink{cl: cl, ser: ser, cfg: cfg, topics: make(map[tableKey]string)}, nil
 }
 
 // Topic resolves the destination topic for an event.
 func (s *Sink) Topic(e *event.NomiosEvent) string {
-	if t, ok := s.cfg.TopicOverrides[e.Source.FQTN()]; ok {
+	k := tableKey{e.Source.Database, e.Source.Table}
+	s.topicMu.RLock()
+	t, ok := s.topics[k]
+	s.topicMu.RUnlock()
+	if ok {
 		return t
 	}
-	r := strings.NewReplacer("{database}", e.Source.Database, "{table}", e.Source.Table)
-	return r.Replace(s.cfg.TopicTemplate)
+	if t, ok = s.cfg.TopicOverrides[e.Source.FQTN()]; !ok {
+		r := strings.NewReplacer("{database}", e.Source.Database, "{table}", e.Source.Table)
+		t = r.Replace(s.cfg.TopicTemplate)
+	}
+	s.topicMu.Lock()
+	s.topics[k] = t
+	s.topicMu.Unlock()
+	return t
 }
 
 // PublishBatch serializes and produces a batch, returning only after every

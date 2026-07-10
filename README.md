@@ -60,6 +60,28 @@ The MySQL tests skip with instructions if no server is available at
 `127.0.0.1:3306` (override via `NOMIOS_TEST_MYSQL_ADDR`,
 `NOMIOS_TEST_MYSQL_USER`, `NOMIOS_TEST_MYSQL_PASSWORD`).
 
+## Benchmarks
+
+```sh
+# Micro: serializer, dispatcher, checkpoint tracker
+go test -bench . -run xxx ./pkg/serialize/ ./pkg/dispatch/ ./pkg/state/
+
+# Pipeline matrix: publisher pool size × batch size (design doc §8 sweep)
+go test -bench BenchmarkHyperloop -run xxx -benchtime 200000x ./pkg/hyperloop/
+
+# End to end with a real Kafka producer (in-memory broker): pool + codecs
+go test -tags integration -bench BenchmarkPipeline -run xxx -benchtime 100000x ./test/integration/
+```
+
+Reference results (4-core CI container, race detector off):
+
+| Benchmark | Result |
+|---|---|
+| Pipeline + JSON serialize (in-process sink) | 600–745k events/s |
+| End-to-end incl. Kafka producer, 1 publisher | ~208k events/s |
+| End-to-end incl. Kafka producer, 4 publishers | ~405k events/s (pool scaling ~2×) |
+| Codec sweep (8 publishers) | lz4 fastest — matches the production default |
+
 ## HTTP API
 
 | Method | Path                        | Purpose            |

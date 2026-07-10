@@ -73,14 +73,16 @@ go test -bench BenchmarkHyperloop -run xxx -benchtime 200000x ./pkg/hyperloop/
 go test -tags integration -bench BenchmarkPipeline -run xxx -benchtime 100000x ./test/integration/
 ```
 
-Reference results (4-core CI container, race detector off):
+Reference results (4-core CI container, race detector off, after the
+optimization passes documented in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md)):
 
 | Benchmark | Result |
 |---|---|
-| Pipeline + JSON serialize (in-process sink) | 600–745k events/s |
-| End-to-end incl. Kafka producer, 1 publisher | ~208k events/s |
-| End-to-end incl. Kafka producer, 4 publishers | ~405k events/s (pool scaling ~2×) |
-| Codec sweep (8 publishers) | lz4 fastest — matches the production default |
+| JSON serialize, 5-col row | 839 ns/event, 2 allocs (hand-rolled encoder) |
+| Dispatcher routing | 8.8 ns/event, 0 allocs; ~22–34 ns/event through queues |
+| Pipeline + JSON serialize (in-process sink) | ~1.19M events/s |
+| End-to-end incl. Kafka producer, 1 publisher | ~686k events/s (async produce) |
+| End-to-end incl. Kafka producer, 4 publishers | ~857k events/s; ~930–950k with lz4/snappy |
 
 ## HTTP API
 

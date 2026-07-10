@@ -11,6 +11,7 @@ import (
 
 	"github.com/duy-tung/cdc-scaling/pkg/event"
 	"github.com/duy-tung/cdc-scaling/pkg/serialize"
+	"github.com/duy-tung/cdc-scaling/pkg/state"
 )
 
 // serializeSink performs the real per-event publisher CPU work
@@ -23,21 +24,25 @@ type serializeSink struct {
 	bytes atomic.Int64
 }
 
-func (s *serializeSink) PublishBatch(_ context.Context, evs []*event.NomiosEvent) error {
+func (s *serializeSink) PublishBatch(_ context.Context, evs []*event.NomiosEvent, done func([]state.Position)) error {
 	var n int64
-	for _, e := range evs {
+	ps := make([]state.Position, len(evs))
+	for i, e := range evs {
 		_, v, err := s.ser.Serialize(e)
 		if err != nil {
 			return err
 		}
 		n += int64(len(v))
+		ps[i] = e.Position
 	}
 	s.count.Add(int64(len(evs)))
 	s.bytes.Add(n)
+	done(ps)
 	return nil
 }
 
-func (s *serializeSink) Close() error { return nil }
+func (s *serializeSink) Flush(context.Context) error { return nil }
+func (s *serializeSink) Close() error                { return nil }
 
 // BenchmarkHyperloop sweeps publisher pool size and batch size over the
 // full pipeline (source → dispatcher → buffer queues → publisher pool →

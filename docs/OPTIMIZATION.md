@@ -163,3 +163,44 @@ targeted cost center actually shrank.
 Combined target: **≥ 2M ev/s in-process, ≥ 800k ev/s end-to-end (kfake)**
 on 4 cores — roughly 3× the current baseline — with allocation rate per
 event reduced ~10×.
+
+---
+
+## 5. Results (implemented: P1–P4)
+
+Measured on the same 4-core container after each phase merged; all unit
+and integration suites pass with `-race` unchanged.
+
+| Benchmark | Baseline | After P1–P4 | Δ |
+|---|---|---|---|
+| `JSONSerialize/cols=5` | 2,381 ns / 25 allocs | **839 ns / 2 allocs** | 2.8× / 12.5× |
+| `Pick` | 43 ns / 1 alloc | **8.8 ns / 0 allocs** | 4.9× |
+| `DispatchThroughput` | 262 ns/event | **22–34 ns/event** | ~10× |
+| Hyperloop in-process | 745k ev/s | **~1.19M ev/s** | 1.6× |
+| Pipeline→Kafka, 1 publisher | 208k ev/s | **686k ev/s** | 3.3× |
+| Pipeline→Kafka, 4 publishers | 405k ev/s | **857k ev/s** (lz4/snappy ~930–950k) | 2.1× |
+
+End-to-end target (≥ 800k ev/s) **met**. The in-process 2M stretch goal
+was not: post-optimization profiles show the benchmark is now bound by
+its own event *generation* (the fake source accounts for 62% of remaining
+allocation — event structs, row maps, ID strings), i.e. the pipeline is no
+longer the bottleneck on 4 cores.
+
+**P5 (columnar row images): deferred.** The trigger condition (GC > 10%
+CPU) technically fires (~15%), but the allocation profile attributes the
+bulk to (a) the bench harness's event generation and (b) the serialized
+payload buffers themselves — which the async sink must retain until ack
+and which columnar images would not eliminate. In production the MySQL
+source is bounded by binlog stream/parse rates well below the pipeline's
+current ceiling. Revisit with production profiles if a real deployment
+shows GC pressure; the refactor design in §3/O6 remains valid.
+
+Notes for operators:
+- Async produce means a produce failure surfaces on the *next*
+  `PublishBatch`/`Flush` call; the checkpoint can never advance past an
+  unacknowledged event (done-callback is withheld on failure).
+- Key rendering changed in P2 (strconv-based): partition→queue assignment
+  of some non-string key values may differ from previous builds. Per-key
+  ordering is unaffected; do a clean drain-and-restart rather than running
+  mixed versions against the same topic if strict cross-version partition
+  affinity matters.

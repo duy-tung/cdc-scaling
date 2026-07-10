@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/duy-tung/cdc-scaling/pkg/event"
 	"github.com/duy-tung/cdc-scaling/pkg/serialize"
+	"github.com/duy-tung/cdc-scaling/pkg/state"
 )
 
 // Config holds Kafka producer settings. Defaults mirror the benchmarked
@@ -26,6 +28,10 @@ type Config struct {
 	TopicOverrides map[string]string `yaml:"topicOverrides"`
 	// AllowAutoTopicCreation asks brokers to auto-create topics.
 	AllowAutoTopicCreation bool `yaml:"allowAutoTopicCreation"`
+	// MaxInflightBatches bounds the total number of submitted-but-unacked
+	// batches across all publishers (memory/backpressure bound for the
+	// asynchronous produce path). Default 32.
+	MaxInflightBatches int `yaml:"maxInflightBatches"`
 }
 
 func (c *Config) withDefaults() {
@@ -35,16 +41,28 @@ func (c *Config) withDefaults() {
 	if c.Compression == "" {
 		c.Compression = "lz4"
 	}
+	if c.MaxInflightBatches <= 0 {
+		c.MaxInflightBatches = 32
+	}
 }
 
-// Sink publishes serialized NomiosEvents to Kafka. It is safe for use by
-// many publisher goroutines concurrently; franz-go batches per partition
-// internally and its idempotent producer (on by default) preserves
-// per-partition ordering.
+// Sink publishes serialized NomiosEvents to Kafka asynchronously: a batch
+// is submitted to the client and acknowledged via per-record promises.
+// Waiting out the produce round-trip in the publisher loop capped a single
+// publisher at ~208k ev/s; with async submission the publisher keeps
+// draining while previous batches are in flight. Per-partition ordering is
+// preserved by franz-go's idempotent producer (on by default), so per-key
+// ordering survives multiple in-flight batches.
+//
+// Safe for use by many publisher goroutines concurrently.
 type Sink struct {
 	cl  *kgo.Client
 	ser serialize.Serializer
 	cfg Config
+
+	inflight chan struct{}  // semaphore: bounds unacked batches
+	pending  sync.WaitGroup // one unit per in-flight batch
+	firstErr atomic.Value   // error: first permanent produce failure
 
 	// topics caches resolved topic names per table so the hot path does no
 	// template substitution (strings.NewReplacer per event showed up in
@@ -82,7 +100,13 @@ func New(cfg Config, ser serialize.Serializer) (*Sink, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kafka: client: %w", err)
 	}
-	return &Sink{cl: cl, ser: ser, cfg: cfg, topics: make(map[tableKey]string)}, nil
+	return &Sink{
+		cl:       cl,
+		ser:      ser,
+		cfg:      cfg,
+		inflight: make(chan struct{}, cfg.MaxInflightBatches),
+		topics:   make(map[tableKey]string),
+	}, nil
 }
 
 // Topic resolves the destination topic for an event.
@@ -104,21 +128,78 @@ func (s *Sink) Topic(e *event.NomiosEvent) string {
 	return t
 }
 
-// PublishBatch serializes and produces a batch, returning only after every
-// record in the batch is acknowledged (or any fails).
-func (s *Sink) PublishBatch(ctx context.Context, events []*event.NomiosEvent) error {
-	records := make([]*kgo.Record, 0, len(events))
-	for _, e := range events {
+func (s *Sink) err() error {
+	if v := s.firstErr.Load(); v != nil {
+		return v.(error)
+	}
+	return nil
+}
+
+// PublishBatch serializes and submits a batch. It returns once the batch
+// is handed to the producer (bounded by MaxInflightBatches); done fires
+// with the batch's positions when every record is acknowledged. On any
+// permanent record failure done is never called and the error surfaces on
+// the next PublishBatch/Flush.
+func (s *Sink) PublishBatch(ctx context.Context, events []*event.NomiosEvent, done func([]state.Position)) error {
+	if err := s.err(); err != nil {
+		return err
+	}
+	// Serialize before taking an in-flight slot so a serialization error
+	// submits nothing.
+	records := make([]*kgo.Record, len(events))
+	positions := make([]state.Position, len(events))
+	for i, e := range events {
 		key, value, err := s.ser.Serialize(e)
 		if err != nil {
 			return fmt.Errorf("kafka: serialize event %s: %w", e.ID, err)
 		}
-		records = append(records, &kgo.Record{Topic: s.Topic(e), Key: key, Value: value})
+		records[i] = &kgo.Record{Topic: s.Topic(e), Key: key, Value: value}
+		positions[i] = e.Position
 	}
-	if err := s.cl.ProduceSync(ctx, records...).FirstErr(); err != nil {
-		return fmt.Errorf("kafka: produce: %w", err)
+
+	select {
+	case s.inflight <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	s.pending.Add(1)
+
+	var remaining atomic.Int64
+	remaining.Store(int64(len(records)))
+	var failed atomic.Bool
+	promise := func(_ *kgo.Record, err error) {
+		if err != nil {
+			failed.Store(true)
+			s.firstErr.CompareAndSwap(nil, fmt.Errorf("kafka: produce: %w", err))
+		}
+		if remaining.Add(-1) == 0 {
+			<-s.inflight
+			if !failed.Load() {
+				done(positions)
+			}
+			s.pending.Done()
+		}
+	}
+	for _, r := range records {
+		s.cl.Produce(ctx, r, promise)
 	}
 	return nil
+}
+
+// Flush waits until every submitted batch is acknowledged and its done
+// callback has returned, then reports any produce failure.
+func (s *Sink) Flush(ctx context.Context) error {
+	if err := s.cl.Flush(ctx); err != nil {
+		return fmt.Errorf("kafka: flush: %w", err)
+	}
+	waited := make(chan struct{})
+	go func() { s.pending.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.err()
 }
 
 func (s *Sink) Close() error {

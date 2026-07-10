@@ -34,8 +34,29 @@ const (
 )
 
 // Sink is where publishers deliver serialized events (Kafka in v1).
+//
+// PublishBatch may be asynchronous: it can return before the events are
+// durable. The sink must invoke done exactly once with the batch's
+// positions after every event in the batch is durably published — possibly
+// concurrently from sink-internal goroutines, possibly after PublishBatch
+// returned. If any event in the batch fails permanently, done must NOT be
+// called (the checkpoint then never advances past the failure) and a
+// subsequent PublishBatch or Flush call must return the error. The sink
+// must not retain the events slice itself (the caller reuses it), though
+// it may retain the events.
+//
+// Asynchronous publishing removes the produce round-trip from the
+// publisher loop: end-to-end profiling showed a single sync publisher
+// capped at ~208k ev/s by RTT stalls vs ~1.1M in-process. Out-of-order
+// completion across batches is safe: the state tracker computes the
+// checkpoint as a contiguous prefix, and per-key ordering is preserved
+// because a key maps to one publisher (submission order) and one Kafka
+// partition (franz-go's idempotent producer keeps per-partition order).
 type Sink interface {
-	PublishBatch(ctx context.Context, events []*event.NomiosEvent) error
+	PublishBatch(ctx context.Context, events []*event.NomiosEvent, done func([]state.Position)) error
+	// Flush blocks until every previously submitted event is durable and
+	// its done callback has returned, or ctx expires.
+	Flush(ctx context.Context) error
 	Close() error
 }
 
@@ -279,6 +300,18 @@ func (h *Hyperloop) run(ctx context.Context) error {
 		h.status.Store(StatusStopping)
 	}
 
+	// All workers have submitted their last batches; wait for the sink's
+	// in-flight publishes to become durable so the final checkpoint covers
+	// them. Skipping this on error/hard-cancel is safe (at-least-once).
+	if firstErr == nil {
+		fctx, fcancel := context.WithTimeout(context.Background(), h.cfg.ShutdownTimeout)
+		if err := h.deps.Sink.Flush(fctx); err != nil {
+			h.log.Error("sink flush failed", "err", err)
+			firstErr = err
+		}
+		fcancel()
+	}
+
 	close(commitStop)
 	commitWg.Wait()
 
@@ -298,28 +331,26 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	return firstErr
 }
 
-// runPublisher drains one buffer queue in batches, publishes each batch to
-// the sink, and reports completed positions to the tracker. The batch
-// buffer is reused across iterations; the Sink contract is that it may
-// retain events but not the batch slice itself.
+// runPublisher drains one buffer queue in batches and submits each batch
+// to the sink. Positions reach the tracker via the sink's async done
+// callback once the batch is durable. The batch buffer is reused across
+// iterations; the Sink contract is that it may retain events but not the
+// batch slice itself.
 func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan []*event.NomiosEvent, tracker *state.Tracker) error {
-	positions := make([]state.Position, 0, h.cfg.BatchMaxSize)
 	buf := make([]*event.NomiosEvent, 0, h.cfg.BatchMaxSize)
+	onDone := func(ps []state.Position) {
+		tracker.DoneBatch(ps)
+		h.published.Add(uint64(len(ps)))
+	}
 	for {
 		batch, open := drainBatch(ctx, q, buf, h.cfg.BatchMaxSize, h.cfg.BatchMaxWait)
 		if len(batch) > 0 {
-			if err := h.deps.Sink.PublishBatch(ctx, batch); err != nil {
+			if err := h.deps.Sink.PublishBatch(ctx, batch, onDone); err != nil {
 				if ctx.Err() != nil {
 					return nil // hard shutdown, not a publisher fault
 				}
 				return err
 			}
-			positions = positions[:0]
-			for _, e := range batch {
-				positions = append(positions, e.Position)
-			}
-			tracker.DoneBatch(positions)
-			h.published.Add(uint64(len(batch)))
 		}
 		if !open {
 			return nil

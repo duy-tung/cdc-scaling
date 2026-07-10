@@ -73,16 +73,23 @@ type memSink struct {
 	fail   error
 }
 
-func (s *memSink) PublishBatch(_ context.Context, evs []*event.NomiosEvent) error {
+func (s *memSink) PublishBatch(_ context.Context, evs []*event.NomiosEvent, done func([]state.Position)) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.fail != nil {
+		s.mu.Unlock()
 		return s.fail
 	}
 	s.events = append(s.events, evs...)
+	ps := make([]state.Position, len(evs))
+	for i, e := range evs {
+		ps[i] = e.Position
+	}
+	s.mu.Unlock()
+	done(ps)
 	return nil
 }
-func (s *memSink) Close() error { return nil }
+func (s *memSink) Flush(context.Context) error { return nil }
+func (s *memSink) Close() error                { return nil }
 
 func (s *memSink) byKey() map[string][]int {
 	s.mu.Lock()
@@ -224,6 +231,60 @@ func TestHyperloopSinkFailureAborts(t *testing.T) {
 	}
 	if hl.Status().Status != StatusFailed {
 		t.Fatalf("status = %s, want failed", hl.Status().Status)
+	}
+}
+
+// asyncSink acknowledges batches from separate goroutines after a small
+// random-ish delay, exercising the asynchronous Sink contract: done fires
+// after PublishBatch returned, possibly out of order across batches.
+type asyncSink struct {
+	memSink
+	wg sync.WaitGroup
+}
+
+func (s *asyncSink) PublishBatch(_ context.Context, evs []*event.NomiosEvent, done func([]state.Position)) error {
+	s.mu.Lock()
+	s.events = append(s.events, evs...)
+	ps := make([]state.Position, len(evs))
+	for i, e := range evs {
+		ps[i] = e.Position
+	}
+	delay := time.Duration(len(s.events)%7) * time.Millisecond // staggered acks
+	s.mu.Unlock()
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		time.Sleep(delay)
+		done(ps)
+	}()
+	return nil
+}
+
+func (s *asyncSink) Flush(context.Context) error {
+	s.wg.Wait()
+	return nil
+}
+
+// TestHyperloopAsyncSink verifies the pipeline with a sink that completes
+// batches asynchronously and out of order: all events published, the final
+// checkpoint still reaches the last SeqNo (Flush-before-commit), and the
+// contiguous-prefix tracker handles the reordering.
+func TestHyperloopAsyncSink(t *testing.T) {
+	const total = 3000
+	src := &fakeSource{n: total, keys: 17}
+	sink := &asyncSink{}
+	store := newMemStore()
+	hl := newTestLoop(t, src, sink, store)
+
+	if err := hl.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(sink.events); got != total {
+		t.Fatalf("published %d events, want %d", got, total)
+	}
+	if ckpt := store.get("test"); ckpt.SeqNo != total {
+		t.Fatalf("checkpoint seq = %d, want %d (async acks must be flushed before final commit)", ckpt.SeqNo, total)
 	}
 }
 

@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +67,38 @@ func mustExec(t *testing.T, conn *client.Conn, q string, args ...any) {
 	}
 }
 
+// sourceHostPort splits the configured test address for the source config.
+func sourceHostPort(t *testing.T) (string, uint16) {
+	t.Helper()
+	host, portStr, err := net.SplitHostPort(mysqlAddr())
+	if err != nil {
+		t.Fatalf("bad NOMIOS_TEST_MYSQL_ADDR %q: %v", mysqlAddr(), err)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		t.Fatalf("bad port in %q: %v", mysqlAddr(), err)
+	}
+	return host, uint16(port)
+}
+
+// masterFilePos reads the server's current binlog file and offset (the
+// file-position-mode analogue of executedGTIDSet).
+func masterFilePos(t *testing.T, conn *client.Conn) (string, uint32) {
+	t.Helper()
+	r, err := conn.Execute("SHOW MASTER STATUS")
+	if err != nil {
+		t.Fatalf("show master status: %v", err)
+	}
+	defer r.Close()
+	if r.RowNumber() == 0 {
+		t.Fatal("binary logging not enabled on test server")
+	}
+	file, _ := r.GetString(0, 0)
+	pos, _ := r.GetUint(0, 1)
+	// GetString is zero-copy into pooled buffers freed by Close.
+	return strings.Clone(file), uint32(pos)
+}
+
 // executedGTIDSet reads the server's current executed GTID set, used to
 // pre-seed the state store so the pipeline deterministically captures
 // everything written after this point (no startup race).
@@ -100,25 +134,37 @@ func fileStore(t *testing.T) state.Store {
 // startLoop builds and starts a hyperloop over the given tables, returning
 // a stop function that gracefully stops it and asserts a clean exit.
 func startLoop(t *testing.T, id string, serverID uint32, include []string, brokers []string, store state.Store) (stop func()) {
+	return startLoopMode(t, id, serverID, include, brokers, store, true)
+}
+
+// startLoopMode is startLoop with an explicit GTID/file-position choice.
+func startLoopMode(t *testing.T, id string, serverID uint32, include []string, brokers []string, store state.Store, gtid bool) (stop func()) {
 	t.Helper()
 	// Pre-seed the state with the current position if none is saved yet.
 	if p, err := store.Load(context.Background(), id); err != nil {
 		t.Fatal(err)
 	} else if p.IsZero() {
 		conn := mysqlConn(t)
-		seed := state.Position{GTIDSet: executedGTIDSet(t, conn)}
+		var seed state.Position
+		if gtid {
+			seed = state.Position{GTIDSet: executedGTIDSet(t, conn)}
+		} else {
+			file, pos := masterFilePos(t, conn)
+			seed = state.Position{File: file, Offset: pos}
+		}
 		if err := store.Save(context.Background(), id, seed); err != nil {
 			t.Fatal(err)
 		}
 	}
 
+	host, port := sourceHostPort(t)
 	src := mysqlsource.New(mysqlsource.Config{
-		Host:     "127.0.0.1",
-		Port:     3306,
+		Host:     host,
+		Port:     port,
 		User:     mysqlUser(),
 		Password: mysqlPassword(),
 		ServerID: serverID,
-		GTID:     true,
+		GTID:     gtid,
 		Include:  include,
 	}, nil)
 
@@ -417,6 +463,70 @@ func TestMySQLReplayFromStaleCheckpoint(t *testing.T) {
 			t.Fatalf("replay never observed: dup count %d, distinct rows %d", byID[firstIDs[1]], len(rowIDs))
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestMySQLFilePositionResume exercises the non-GTID mode end to end:
+// capture with file/offset coordinates, resume across a restart, and
+// file-based fallback event IDs.
+func TestMySQLFilePositionResume(t *testing.T) {
+	conn := mysqlConn(t)
+	mustExec(t, conn, "DROP TABLE IF EXISTS fp_items")
+	mustExec(t, conn, "CREATE TABLE fp_items (id INT NOT NULL PRIMARY KEY)")
+
+	topic := "cdc." + testDB + ".fp_items"
+	cluster := kafkaCluster(t, topic)
+	include := []string{testDB + ".fp_items"}
+	store := fileStore(t)
+
+	// Phase 1: capture 20 inserts in file-position mode, stop gracefully.
+	stop1 := startLoopMode(t, "it-filepos", 5509, include, cluster.ListenAddrs(), store, false)
+	for i := 1; i <= 20; i++ {
+		mustExec(t, conn, "INSERT INTO fp_items VALUES (?)", i)
+	}
+	events := consumeUntil(t, cluster.ListenAddrs(), topic, 60*time.Second, atLeast(20))
+	stop1()
+
+	// Note on IDs: file-position mode changes how the stream RESUMES, not
+	// how events are identified. The test server runs gtid_mode=ON, so
+	// GTID events still appear in the stream and IDs keep the stable
+	// gtid#order form; the file:pos:row fallback applies only on servers
+	// without GTIDs in the binlog. Assert uniqueness, not form.
+	seenIDs := map[string]bool{}
+	for _, e := range events {
+		if e.ID == "" || seenIDs[e.ID] {
+			t.Fatalf("event ID empty or duplicated: %q", e.ID)
+		}
+		seenIDs[e.ID] = true
+	}
+	ckpt, err := store.Load(context.Background(), "it-filepos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ckpt.File == "" || ckpt.GTIDSet != "" {
+		t.Fatalf("file-mode checkpoint should carry file coordinates only: %+v", ckpt)
+	}
+
+	// Phase 2: 15 rows while down, restart from the file checkpoint.
+	for i := 21; i <= 35; i++ {
+		mustExec(t, conn, "INSERT INTO fp_items VALUES (?)", i)
+	}
+	startLoopMode(t, "it-filepos", 5510, include, cluster.ListenAddrs(), store, false)
+	events = consumeUntil(t, cluster.ListenAddrs(), topic, 60*time.Second, func(seen map[string]envelope) bool {
+		ids := map[int]bool{}
+		for _, e := range seen {
+			ids[int(e.After["id"].(float64))] = true
+		}
+		return len(ids) >= 35
+	})
+	ids := map[int]bool{}
+	for _, e := range events {
+		ids[int(e.After["id"].(float64))] = true
+	}
+	for i := 1; i <= 35; i++ {
+		if !ids[i] {
+			t.Fatalf("gap after file-position restart: id %d never captured", i)
+		}
 	}
 }
 

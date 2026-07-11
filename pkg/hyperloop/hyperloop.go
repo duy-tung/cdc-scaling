@@ -198,6 +198,7 @@ func (h *Hyperloop) Status() StatusReport {
 // pipeline and always attempts a final state commit before returning.
 func (h *Hyperloop) Run(ctx context.Context) error {
 	h.status.Store(StatusStarting)
+	h.lastErr.Store("") // a restarted run must not display the previous run's error
 	err := h.run(ctx)
 	if err != nil {
 		h.lastErr.Store(err.Error())

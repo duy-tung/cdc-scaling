@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"time"
 
 	"github.com/duy-tung/cdc-scaling/pkg/event"
 )
@@ -184,6 +185,12 @@ func (d *Dispatcher) Pick(e *event.NomiosEvent) int {
 	return int(h % uint32(len(d.queues)))
 }
 
+// stagingFlushInterval bounds how long a sparse queue's staged events can
+// wait while the input stays saturated (flush-on-idle never fires under
+// continuous load, and flush-on-size may take arbitrarily long for a
+// low-traffic key).
+const stagingFlushInterval = 25 * time.Millisecond
+
 // Run consumes event batches from in until it is closed or ctx is
 // cancelled, routing each event to its queue (blocking when the queue is
 // full). On return it flushes staged events and closes all queues so
@@ -194,6 +201,8 @@ func (d *Dispatcher) Run(ctx context.Context, in <-chan []*event.NomiosEvent) er
 			close(q)
 		}
 	}()
+	ticker := time.NewTicker(stagingFlushInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case batch, ok := <-in:
@@ -214,6 +223,10 @@ func (d *Dispatcher) Run(ctx context.Context, in <-chan []*event.NomiosEvent) er
 				if err := d.flushAll(ctx); err != nil {
 					return err
 				}
+			}
+		case <-ticker.C:
+			if err := d.flushAll(ctx); err != nil {
+				return err
 			}
 		case <-ctx.Done():
 			return ctx.Err()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -65,13 +66,26 @@ type State struct {
 	CommitIntervalMs int    `yaml:"commitIntervalMs"`
 }
 
-// Load reads and parses a YAML config file, expanding ${ENV_VAR} references.
+// Load reads and parses a YAML config file, expanding ${ENV_VAR}
+// references. Referencing an undefined environment variable is an error:
+// silently expanding to "" would turn a missing password or broker list
+// into a confusing runtime failure far from its cause.
 func Load(path string) (*File, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: read: %w", err)
 	}
-	expanded := os.Expand(string(b), os.Getenv)
+	var missing []string
+	expanded := os.Expand(string(b), func(name string) string {
+		if v, ok := os.LookupEnv(name); ok {
+			return v
+		}
+		missing = append(missing, name)
+		return ""
+	})
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("config: undefined environment variable(s): %s", strings.Join(missing, ", "))
+	}
 	var f File
 	if err := yaml.Unmarshal([]byte(expanded), &f); err != nil {
 		return nil, fmt.Errorf("config: parse: %w", err)

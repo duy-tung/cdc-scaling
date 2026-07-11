@@ -20,9 +20,11 @@ import (
 )
 
 // kafkaCluster starts an in-memory Kafka cluster seeded with the topics.
+// Topics get 4 partitions so per-key ordering assertions exercise real
+// key-based partition selection, not the trivial single-partition case.
 func kafkaCluster(t *testing.T, topics ...string) *kfake.Cluster {
 	t.Helper()
-	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(1, topics...))
+	c, err := kfake.NewCluster(kfake.NumBrokers(1), kfake.SeedTopics(4, topics...))
 	if err != nil {
 		t.Fatalf("kfake: %v", err)
 	}

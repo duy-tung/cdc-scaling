@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -338,6 +339,57 @@ func TestHyperloopAsyncSink(t *testing.T) {
 	}
 	if ckpt := store.get("test"); ckpt.SeqNo != total {
 		t.Fatalf("checkpoint seq = %d, want %d (async acks must be flushed before final commit)", ckpt.SeqNo, total)
+	}
+}
+
+// stuckSink blocks forever in PublishBatch, ignoring its context — the
+// worst case the bounded-shutdown path must survive.
+type stuckSink struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (s *stuckSink) PublishBatch(context.Context, []*event.NomiosEvent, func([]state.Position)) error {
+	s.once.Do(func() { close(s.entered) })
+	select {} // never returns
+}
+func (s *stuckSink) Flush(context.Context) error { return nil }
+func (s *stuckSink) Close() error                { return nil }
+
+// TestHyperloopAbandonsStuckShutdown: with a sink that ignores
+// cancellation, a graceful stop must still return within roughly
+// 2×ShutdownTimeout, reporting the abandonment instead of hanging forever.
+func TestHyperloopAbandonsStuckShutdown(t *testing.T) {
+	src := &fakeSource{n: 10, keys: 2, blockAtEnd: true}
+	sink := &stuckSink{entered: make(chan struct{})}
+	hl, err := New(Config{
+		ID:              "stuck",
+		Queues:          1,
+		BatchMaxWait:    time.Millisecond,
+		CommitInterval:  10 * time.Millisecond,
+		ShutdownTimeout: 200 * time.Millisecond,
+	}, Deps{Source: src, Sink: sink, Store: newMemStore()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- hl.Run(ctx) }()
+
+	<-sink.entered // the publisher is now wedged inside the sink
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "abandoned") {
+			t.Fatalf("expected abandonment error, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return: shutdown is not bounded")
+	}
+	if hl.Status().Status != StatusFailed {
+		t.Fatalf("status = %s, want failed", hl.Status().Status)
 	}
 }
 

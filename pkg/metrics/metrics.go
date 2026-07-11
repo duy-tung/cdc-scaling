@@ -24,6 +24,7 @@ type Nomios struct {
 	stateGauge    *prometheus.GaugeVec
 	queueDepth    *prometheus.GaugeVec
 	sourceLag     *prometheus.GaugeVec
+	lastEventTS   *prometheus.GaugeVec
 	saveFailures  *prometheus.CounterVec
 
 	mu           sync.Mutex
@@ -57,7 +58,11 @@ func New(reg prometheus.Registerer) *Nomios {
 		}, []string{"hyperloop", "queue"}),
 		sourceLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "nomios_source_lag_seconds",
-			Help: "Now minus the binlog timestamp of the newest published event.",
+			Help: "Event freshness: now minus the binlog timestamp of the newest durably published event. Grows on an idle-but-healthy source, so treat it as an upper bound on replication lag.",
+		}, []string{"hyperloop"}),
+		lastEventTS: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "nomios_last_published_event_timestamp_seconds",
+			Help: "Binlog timestamp (unix seconds) of the newest durably published event.",
 		}, []string{"hyperloop"}),
 		saveFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "nomios_state_save_failures_total",
@@ -67,7 +72,7 @@ func New(reg prometheus.Registerer) *Nomios {
 		lastSaveFail: make(map[string]uint64),
 	}
 	reg.MustRegister(m.published, m.checkpointSeq, m.persistedSeq, m.stateGauge,
-		m.queueDepth, m.sourceLag, m.saveFailures)
+		m.queueDepth, m.sourceLag, m.lastEventTS, m.saveFailures)
 	return m
 }
 
@@ -101,6 +106,7 @@ func (m *Nomios) Observe(s hyperloop.StatusReport) {
 			lag = 0
 		}
 		m.sourceLag.WithLabelValues(s.ID).Set(lag)
+		m.lastEventTS.WithLabelValues(s.ID).Set(float64(s.LastEventUnixMs) / 1000)
 	}
 
 	m.mu.Lock()

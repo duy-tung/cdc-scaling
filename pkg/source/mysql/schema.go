@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -123,6 +124,10 @@ func (r *schemaRegistry) load(db, table string) (*TableSchema, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Clone: the cached schema outlives Result.Close, and GetString
+		// returns zero-copy views into pooled buffers. key/dataType are
+		// only inspected inside this loop and need no clone.
+		name = strings.Clone(name)
 		key, _ := res.GetString(i, 1)
 		dataType, _ := res.GetString(i, 2)
 		s.Columns = append(s.Columns, name)

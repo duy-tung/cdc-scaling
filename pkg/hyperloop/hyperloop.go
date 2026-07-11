@@ -140,9 +140,13 @@ type StatusReport struct {
 	Checkpoint state.Position `json:"checkpoint"`
 	Persisted  state.Position `json:"persisted_checkpoint"`
 	// LastEventUnixMs is the event time (binlog timestamp) of the newest
-	// published event — "now minus this" approximates source lag.
+	// DURABLY PUBLISHED (sink-acknowledged) event. "Now minus this" is
+	// event freshness/age: it grows on a healthy but idle database, so it
+	// is an upper bound on replication lag, not a strict measurement.
 	LastEventUnixMs int64 `json:"last_event_unix_ms,omitempty"`
-	// StateSaveFailures counts failed checkpoint persists this run.
+	// StateSaveFailures counts failed checkpoint persists over the
+	// lifetime of this hyperloop object (it is not reset between Run
+	// restarts — counter semantics).
 	StateSaveFailures uint64 `json:"state_save_failures,omitempty"`
 	QueueDepths       []int  `json:"queue_depths,omitempty"`
 	LastError         string `json:"last_error,omitempty"`
@@ -394,32 +398,47 @@ func (h *Hyperloop) run(ctx context.Context) error {
 // batch slice itself.
 func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan []*event.NomiosEvent, tracker *state.Tracker) error {
 	buf := make([]*event.NomiosEvent, 0, h.cfg.BatchMaxSize)
-	onDone := func(ps []state.Position) {
-		tracker.DoneBatch(ps)
-		h.published.Add(uint64(len(ps)))
-	}
 	for {
 		batch, open := drainBatch(ctx, q, buf, h.cfg.BatchMaxSize, h.cfg.BatchMaxWait)
 		if len(batch) > 0 {
-			if err := h.deps.Sink.PublishBatch(ctx, batch, onDone); err != nil {
+			// The batch's newest event time is captured before submission
+			// but recorded only inside the ack callback: LastEventUnixMs
+			// means "newest DURABLY PUBLISHED event", and async
+			// PublishBatch returns before acknowledgement.
+			var maxMs int64
+			for _, e := range batch {
+				if ms := e.OccurredAt.UnixMilli(); ms > maxMs {
+					maxMs = ms
+				}
+			}
+			done := func(ps []state.Position) {
+				tracker.DoneBatch(ps)
+				h.published.Add(uint64(len(ps)))
+				h.recordLastEvent(maxMs)
+			}
+			if err := h.deps.Sink.PublishBatch(ctx, batch, done); err != nil {
 				if ctx.Err() != nil {
 					return nil // hard shutdown, not a publisher fault
 				}
 				return err
 			}
-			// Track the newest event time seen for source-lag reporting
-			// (atomic max: queues progress independently).
-			if ms := batch[len(batch)-1].OccurredAt.UnixMilli(); ms > 0 {
-				for {
-					cur := h.lastEventMs.Load()
-					if ms <= cur || h.lastEventMs.CompareAndSwap(cur, ms) {
-						break
-					}
-				}
-			}
 		}
 		if !open {
 			return nil
+		}
+	}
+}
+
+// recordLastEvent tracks the newest acknowledged event time (atomic max:
+// queues and ack callbacks progress independently).
+func (h *Hyperloop) recordLastEvent(ms int64) {
+	if ms <= 0 {
+		return
+	}
+	for {
+		cur := h.lastEventMs.Load()
+		if ms <= cur || h.lastEventMs.CompareAndSwap(cur, ms) {
+			return
 		}
 	}
 }

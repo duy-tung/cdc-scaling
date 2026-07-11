@@ -43,6 +43,32 @@ func TestTrackerContiguousCheckpoint(t *testing.T) {
 	}
 }
 
+func TestTrackerRedirty(t *testing.T) {
+	tr := NewTracker()
+
+	// Redirty before any checkpoint exists is a no-op.
+	tr.Redirty()
+	if _, dirty := tr.TakeDirty(); dirty {
+		t.Fatal("empty tracker must not become dirty")
+	}
+
+	tr.Done(Position{SeqNo: 1, File: "b1"})
+	if p, dirty := tr.TakeDirty(); !dirty || p.SeqNo != 1 {
+		t.Fatalf("TakeDirty = %+v, %v", p, dirty)
+	}
+	if _, dirty := tr.TakeDirty(); dirty {
+		t.Fatal("second TakeDirty should be clean")
+	}
+
+	// A failed save calls Redirty: the SAME checkpoint must be retryable
+	// on the next tick without the checkpoint advancing.
+	tr.Redirty()
+	p, dirty := tr.TakeDirty()
+	if !dirty || p.SeqNo != 1 || p.File != "b1" {
+		t.Fatalf("after Redirty, TakeDirty = %+v, %v; want the same checkpoint", p, dirty)
+	}
+}
+
 func TestTrackerConcurrent(t *testing.T) {
 	tr := NewTracker()
 	const n = 10000

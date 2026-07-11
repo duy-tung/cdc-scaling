@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,7 +82,8 @@ func executedGTIDSet(t *testing.T, conn *client.Conn) string {
 	if set == "" {
 		t.Fatal("executed GTID set is empty; is gtid_mode=ON?")
 	}
-	return set
+	// GetString is zero-copy into pooled buffers freed by Close.
+	return strings.Clone(set)
 }
 
 // fileStore is the default state store for tests that don't exercise

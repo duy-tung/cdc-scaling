@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,11 +77,21 @@ func (s *MySQLStore) Load(_ context.Context, id string) (Position, error) {
 	if r.RowNumber() == 0 {
 		return Position{}, nil
 	}
+	// go-mysql's GetString returns zero-copy views into the Resultset's
+	// pooled buffers; Result.Close returns those buffers to a sync.Pool
+	// where the next query overwrites them. Every string that outlives
+	// Close MUST be cloned — without this, the loaded GTID set was
+	// observed mutating into bytes of a later query.
 	gtid, _ := r.GetString(0, 0)
 	file, _ := r.GetString(0, 1)
 	pos, _ := r.GetUint(0, 2)
 	seq, _ := r.GetUint(0, 3)
-	return Position{GTIDSet: gtid, File: file, Offset: uint32(pos), SeqNo: seq}, nil
+	return Position{
+		GTIDSet: strings.Clone(gtid),
+		File:    strings.Clone(file),
+		Offset:  uint32(pos),
+		SeqNo:   seq,
+	}, nil
 }
 
 func (s *MySQLStore) Save(_ context.Context, id string, p Position) error {

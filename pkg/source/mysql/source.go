@@ -181,7 +181,9 @@ func (s *Source) validateServer() error {
 			return "", nil
 		}
 		v, _ := r.GetString(0, 1)
-		return v, nil
+		// GetString is zero-copy into pooled buffers; clone anything that
+		// outlives Result.Close.
+		return strings.Clone(v), nil
 	}
 
 	format, err := get("binlog_format")
@@ -225,10 +227,13 @@ func (s *Source) masterStatus() (gtidSet, file string, pos uint32, err error) {
 	if r.RowNumber() == 0 {
 		return "", "", 0, errors.New("mysql source: binary logging is not enabled on the server")
 	}
+	// Clone: GetString values are backed by pooled buffers freed on Close.
 	file, _ = r.GetString(0, 0)
+	file = strings.Clone(file)
 	p, _ := r.GetUint(0, 1)
 	if r.ColumnNumber() > 4 {
 		gtidSet, _ = r.GetString(0, 4)
+		gtidSet = strings.Clone(gtidSet)
 	}
 	return gtidSet, file, uint32(p), nil
 }

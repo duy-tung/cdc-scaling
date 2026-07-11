@@ -234,6 +234,59 @@ func TestHyperloopSinkFailureAborts(t *testing.T) {
 	}
 }
 
+// flakyStore fails its first N saves, simulating a temporarily unreachable
+// state store.
+type flakyStore struct {
+	*memStore
+	failMu    sync.Mutex
+	failFirst int
+}
+
+func (s *flakyStore) Save(ctx context.Context, id string, p state.Position) error {
+	s.failMu.Lock()
+	if s.failFirst > 0 {
+		s.failFirst--
+		s.failMu.Unlock()
+		return errors.New("state store unavailable")
+	}
+	s.failMu.Unlock()
+	return s.memStore.Save(ctx, id, p)
+}
+
+// TestHyperloopRetriesFailedStateSave: a failed periodic checkpoint save
+// must be retried on the next commit tick even when the checkpoint has not
+// advanced (Tracker.Redirty), and the failure must be counted.
+func TestHyperloopRetriesFailedStateSave(t *testing.T) {
+	const total = 500
+	src := &fakeSource{n: total, keys: 7, blockAtEnd: true}
+	sink := &memSink{}
+	store := &flakyStore{memStore: newMemStore(), failFirst: 2}
+	hl := newTestLoop(t, src, sink, store)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- hl.Run(ctx) }()
+
+	// Wait until the periodic committer succeeded despite the initial
+	// failures — the stream is idle after `total`, so only Redirty makes
+	// the retry happen before shutdown.
+	deadline := time.After(10 * time.Second)
+	for store.get("test").SeqNo != total {
+		select {
+		case <-deadline:
+			t.Fatalf("checkpoint never persisted; store=%+v", store.get("test"))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if got := hl.Status().StateSaveFailures; got < 2 {
+		t.Fatalf("StateSaveFailures = %d, want >= 2", got)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
 // asyncSink acknowledges batches from separate goroutines after a small
 // random-ish delay, exercising the asynchronous Sink contract: done fires
 // after PublishBatch returned, possibly out of order across batches.

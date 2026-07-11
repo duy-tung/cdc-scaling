@@ -41,8 +41,13 @@ go build ./cmd/nomios
 ./nomios -config configs/nomios.yaml
 ```
 
-MySQL requirements: `binlog_format=ROW` (8.0 default), `gtid_mode=ON`,
-a user with `REPLICATION SLAVE, REPLICATION CLIENT, SELECT`.
+MySQL requirements: `binlog_format=ROW` and `binlog_row_image=FULL` (8.0
+defaults), `gtid_mode=ON`. The Nomios user needs
+`REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.*` for capture, plus —
+when using the default MySQL state store — `CREATE, SELECT, INSERT,
+UPDATE, DELETE` on the state database (it creates and writes the
+`nomios_state` table). See `scripts/setup-test-mysql.sh` for a working
+grant set.
 
 ## Test
 

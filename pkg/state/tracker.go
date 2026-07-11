@@ -84,6 +84,19 @@ func (t *Tracker) TakeDirty() (Position, bool) {
 	return t.ckpt, true
 }
 
+// Redirty re-marks the checkpoint dirty. The committer calls it when a
+// state save fails: TakeDirty already cleared the flag, and without
+// re-marking, the failed save would only be retried after the checkpoint
+// advances again — on an idle stream that could postpone persistence
+// indefinitely and enlarge the crash-replay window.
+func (t *Tracker) Redirty() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.has {
+		t.dirty = true
+	}
+}
+
 // Outstanding reports how many completed events are waiting for an earlier
 // SeqNo to complete (useful for diagnostics).
 func (t *Tracker) Outstanding() int {

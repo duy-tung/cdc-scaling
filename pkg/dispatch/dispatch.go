@@ -85,7 +85,10 @@ func appendEscaped(b []byte, s string) []byte {
 func appendKeyValue(b []byte, v any) []byte {
 	switch x := v.(type) {
 	case nil:
-		return b
+		// NULL must be distinguishable from the empty string. `\N` cannot
+		// be produced by any escaped data value (escaping only ever yields
+		// `\\` or `\|`), so it is collision-free.
+		return append(b, '\\', 'N')
 	case string:
 		return appendEscaped(b, x)
 	case []byte:

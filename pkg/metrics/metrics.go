@@ -8,6 +8,7 @@ package metrics
 import (
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -22,9 +23,12 @@ type Nomios struct {
 	persistedSeq  *prometheus.GaugeVec
 	stateGauge    *prometheus.GaugeVec
 	queueDepth    *prometheus.GaugeVec
+	sourceLag     *prometheus.GaugeVec
+	saveFailures  *prometheus.CounterVec
 
-	mu      sync.Mutex
-	lastPub map[string]uint64 // per hyperloop, to convert snapshots to counter increments
+	mu           sync.Mutex
+	lastPub      map[string]uint64 // per hyperloop, to convert snapshots to counter increments
+	lastSaveFail map[string]uint64
 }
 
 // New registers the Nomios collectors with reg (use
@@ -51,9 +55,19 @@ func New(reg prometheus.Registerer) *Nomios {
 			Name: "nomios_queue_depth",
 			Help: "Approximate buffered events per queue.",
 		}, []string{"hyperloop", "queue"}),
-		lastPub: make(map[string]uint64),
+		sourceLag: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "nomios_source_lag_seconds",
+			Help: "Now minus the binlog timestamp of the newest published event.",
+		}, []string{"hyperloop"}),
+		saveFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "nomios_state_save_failures_total",
+			Help: "Failed checkpoint persists.",
+		}, []string{"hyperloop"}),
+		lastPub:      make(map[string]uint64),
+		lastSaveFail: make(map[string]uint64),
 	}
-	reg.MustRegister(m.published, m.checkpointSeq, m.persistedSeq, m.stateGauge, m.queueDepth)
+	reg.MustRegister(m.published, m.checkpointSeq, m.persistedSeq, m.stateGauge,
+		m.queueDepth, m.sourceLag, m.saveFailures)
 	return m
 }
 
@@ -81,15 +95,33 @@ func (m *Nomios) Observe(s hyperloop.StatusReport) {
 		m.queueDepth.WithLabelValues(s.ID, strconv.Itoa(i)).Set(float64(d))
 	}
 
+	if s.LastEventUnixMs > 0 {
+		lag := time.Since(time.UnixMilli(s.LastEventUnixMs)).Seconds()
+		if lag < 0 {
+			lag = 0
+		}
+		m.sourceLag.WithLabelValues(s.ID).Set(lag)
+	}
+
 	m.mu.Lock()
-	last := m.lastPub[s.ID]
-	delta := s.Published - last
-	if s.Published < last {
-		delta = s.Published
-	}
-	m.lastPub[s.ID] = s.Published
+	pubDelta := counterDelta(m.lastPub, s.ID, s.Published)
+	failDelta := counterDelta(m.lastSaveFail, s.ID, s.StateSaveFailures)
 	m.mu.Unlock()
-	if delta > 0 {
-		m.published.WithLabelValues(s.ID).Add(float64(delta))
+	if pubDelta > 0 {
+		m.published.WithLabelValues(s.ID).Add(float64(pubDelta))
 	}
+	if failDelta > 0 {
+		m.saveFailures.WithLabelValues(s.ID).Add(float64(failDelta))
+	}
+}
+
+// counterDelta converts monotonic snapshot values into counter increments,
+// treating a decrease (hyperloop restart) as a fresh baseline.
+func counterDelta(last map[string]uint64, id string, now uint64) uint64 {
+	prev := last[id]
+	last[id] = now
+	if now < prev {
+		return now
+	}
+	return now - prev
 }

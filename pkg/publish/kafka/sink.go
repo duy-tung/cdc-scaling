@@ -77,9 +77,15 @@ type tableKey struct{ db, table string }
 
 func New(cfg Config, ser serialize.Serializer) (*Sink, error) {
 	cfg.withDefaults()
+	// The per-key ordering guarantee depends on producer idempotence
+	// (per-partition ordering across in-flight requests) and deterministic
+	// key hashing. Both are franz-go defaults, but they are load-bearing
+	// here, so pin them explicitly rather than inherit whatever a future
+	// dependency default might be. Do NOT add kgo.DisableIdempotentWrite.
 	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
+		kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
 	}
 	if cfg.AllowAutoTopicCreation {
 		opts = append(opts, kgo.AllowAutoTopicCreation())

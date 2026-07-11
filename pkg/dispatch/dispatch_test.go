@@ -134,4 +134,18 @@ func TestKeyEscapingPreventsCollisions(t *testing.T) {
 	if k1 != KeyFromColumns("db.t", map[string]any{"x": "a|b", "y": "c"}, []string{"x", "y"}) {
 		t.Fatal("escaped key not deterministic")
 	}
+
+	// NULL, empty string and the literal string `\N` are three distinct
+	// key values (nullable override columns must not conflate entities).
+	kNull := KeyFromColumns("db.t", map[string]any{"x": "a", "y": nil}, []string{"x", "y"})
+	kEmpty := KeyFromColumns("db.t", map[string]any{"x": "a", "y": ""}, []string{"x", "y"})
+	kLit := KeyFromColumns("db.t", map[string]any{"x": "a", "y": `\N`}, []string{"x", "y"})
+	if kNull == kEmpty || kNull == kLit || kEmpty == kLit {
+		t.Fatalf("NULL/empty/literal keys collide: %q %q %q", kNull, kEmpty, kLit)
+	}
+	// A missing override column behaves like NULL, distinct from empty.
+	kMissing := KeyFromColumns("db.t", map[string]any{"x": "a"}, []string{"x", "y"})
+	if kMissing != kNull {
+		t.Fatalf("missing column %q should key like NULL %q", kMissing, kNull)
+	}
 }

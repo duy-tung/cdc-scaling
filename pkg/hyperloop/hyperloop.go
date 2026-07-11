@@ -117,12 +117,14 @@ type Hyperloop struct {
 	deps Deps
 	log  *slog.Logger
 
-	status     atomic.Value // Status
-	dispatcher atomic.Pointer[dispatch.Dispatcher]
-	tracker    atomic.Pointer[state.Tracker]
-	published  atomic.Uint64
-	lastErr    atomic.Value // string
-	persisted  atomic.Value // state.Position: last successfully saved
+	status       atomic.Value // Status
+	dispatcher   atomic.Pointer[dispatch.Dispatcher]
+	tracker      atomic.Pointer[state.Tracker]
+	published    atomic.Uint64
+	lastErr      atomic.Value // string
+	persisted    atomic.Value // state.Position: last successfully saved
+	lastEventMs  atomic.Int64 // OccurredAt of the newest published event
+	saveFailures atomic.Uint64
 }
 
 // StatusReport is a point-in-time view of a hyperloop for monitoring.
@@ -135,10 +137,15 @@ type StatusReport struct {
 	// written to the state store. They differ when a state save is behind
 	// or failing — resume happens from Persisted, so monitoring must see
 	// both.
-	Checkpoint  state.Position `json:"checkpoint"`
-	Persisted   state.Position `json:"persisted_checkpoint"`
-	QueueDepths []int          `json:"queue_depths,omitempty"`
-	LastError   string         `json:"last_error,omitempty"`
+	Checkpoint state.Position `json:"checkpoint"`
+	Persisted  state.Position `json:"persisted_checkpoint"`
+	// LastEventUnixMs is the event time (binlog timestamp) of the newest
+	// published event — "now minus this" approximates source lag.
+	LastEventUnixMs int64 `json:"last_event_unix_ms,omitempty"`
+	// StateSaveFailures counts failed checkpoint persists this run.
+	StateSaveFailures uint64 `json:"state_save_failures,omitempty"`
+	QueueDepths       []int  `json:"queue_depths,omitempty"`
+	LastError         string `json:"last_error,omitempty"`
 }
 
 func New(cfg Config, deps Deps) (*Hyperloop, error) {
@@ -163,10 +170,12 @@ func (h *Hyperloop) ID() string { return h.cfg.ID }
 // Status returns a monitoring snapshot.
 func (h *Hyperloop) Status() StatusReport {
 	rep := StatusReport{
-		ID:        h.cfg.ID,
-		Status:    h.status.Load().(Status),
-		Published: h.published.Load(),
-		LastError: h.lastErr.Load().(string),
+		ID:                h.cfg.ID,
+		Status:            h.status.Load().(Status),
+		Published:         h.published.Load(),
+		LastError:         h.lastErr.Load().(string),
+		LastEventUnixMs:   h.lastEventMs.Load(),
+		StateSaveFailures: h.saveFailures.Load(),
 	}
 	if t := h.tracker.Load(); t != nil {
 		rep.Checkpoint, _ = t.Checkpoint()
@@ -366,6 +375,7 @@ func (h *Hyperloop) run(ctx context.Context) error {
 		defer cancel()
 		if err := h.deps.Store.Save(cctx, h.cfg.ID, ckpt); err != nil {
 			h.log.Error("final state commit failed", "err", err)
+			h.saveFailures.Add(1)
 			if runErr == nil {
 				runErr = err
 			}
@@ -396,6 +406,16 @@ func (h *Hyperloop) runPublisher(ctx context.Context, id int, q <-chan []*event.
 					return nil // hard shutdown, not a publisher fault
 				}
 				return err
+			}
+			// Track the newest event time seen for source-lag reporting
+			// (atomic max: queues progress independently).
+			if ms := batch[len(batch)-1].OccurredAt.UnixMilli(); ms > 0 {
+				for {
+					cur := h.lastEventMs.Load()
+					if ms <= cur || h.lastEventMs.CompareAndSwap(cur, ms) {
+						break
+					}
+				}
 			}
 		}
 		if !open {
@@ -461,6 +481,10 @@ func (h *Hyperloop) runCommitter(stop <-chan struct{}, tracker *state.Tracker, f
 				cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				if err := h.deps.Store.Save(cctx, h.cfg.ID, ckpt); err != nil {
 					h.log.Error("state commit failed", "err", err)
+					h.saveFailures.Add(1)
+					// TakeDirty cleared the flag: re-mark so the save is
+					// retried next tick even if the checkpoint is idle.
+					tracker.Redirty()
 				} else {
 					h.persisted.Store(ckpt)
 				}

@@ -100,3 +100,39 @@ func consumeUntil(t *testing.T, brokers []string, topic string, timeout time.Dur
 func atLeast(n int) func(map[string]envelope) bool {
 	return func(seen map[string]envelope) bool { return len(seen) >= n }
 }
+
+// rawRecords reads every record currently in the topic WITHOUT
+// deduplication — used to assert that replays actually happened.
+func rawRecords(t *testing.T, brokers []string, topic string) []envelope {
+	t.Helper()
+	cl, err := kgo.NewClient(
+		kgo.SeedBrokers(brokers...),
+		kgo.ConsumeTopics(topic),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+	defer cl.Close()
+
+	var out []envelope
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		fetches := cl.PollFetches(ctx)
+		cancel()
+		empty := true
+		fetches.EachRecord(func(r *kgo.Record) {
+			empty = false
+			var e envelope
+			if err := json.Unmarshal(r.Value, &e); err != nil {
+				t.Errorf("bad payload %q: %v", r.Value, err)
+				return
+			}
+			e.key = string(r.Key)
+			out = append(out, e)
+		})
+		if empty {
+			return out
+		}
+	}
+}

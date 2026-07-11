@@ -62,7 +62,9 @@ type Sink struct {
 
 	inflight chan struct{}  // semaphore: bounds unacked batches
 	pending  sync.WaitGroup // one unit per in-flight batch
-	firstErr atomic.Value   // error: first permanent produce failure
+
+	errMu    sync.Mutex
+	firstErr error // first permanent produce failure since the last Reset
 
 	// topics caches resolved topic names per table so the hot path does no
 	// template substitution (strings.NewReplacer per event showed up in
@@ -128,11 +130,32 @@ func (s *Sink) Topic(e *event.NomiosEvent) string {
 	return t
 }
 
-func (s *Sink) err() error {
-	if v := s.firstErr.Load(); v != nil {
-		return v.(error)
+// Err reports the first asynchronous produce failure since the last
+// Reset. The hyperloop's committer polls it so an idle pipeline surfaces
+// a failed producer instead of appearing healthy until the next publish.
+func (s *Sink) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.firstErr
+}
+
+func (s *Sink) setErr(err error) {
+	s.errMu.Lock()
+	if s.firstErr == nil {
+		s.firstErr = err
 	}
-	return nil
+	s.errMu.Unlock()
+}
+
+// Reset clears the sticky produce error. The hyperloop calls it when a
+// run starts: after a failure the checkpoint never advanced past the
+// unacknowledged events, so the restarted run replays them — keeping the
+// old error would make every Manager restart fail instantly and
+// permanently against a recovered broker.
+func (s *Sink) Reset() {
+	s.errMu.Lock()
+	s.firstErr = nil
+	s.errMu.Unlock()
 }
 
 // PublishBatch serializes and submits a batch. It returns once the batch
@@ -141,7 +164,7 @@ func (s *Sink) err() error {
 // permanent record failure done is never called and the error surfaces on
 // the next PublishBatch/Flush.
 func (s *Sink) PublishBatch(ctx context.Context, events []*event.NomiosEvent, done func([]state.Position)) error {
-	if err := s.err(); err != nil {
+	if err := s.Err(); err != nil {
 		return err
 	}
 	// Serialize before taking an in-flight slot so a serialization error
@@ -170,7 +193,7 @@ func (s *Sink) PublishBatch(ctx context.Context, events []*event.NomiosEvent, do
 	promise := func(_ *kgo.Record, err error) {
 		if err != nil {
 			failed.Store(true)
-			s.firstErr.CompareAndSwap(nil, fmt.Errorf("kafka: produce: %w", err))
+			s.setErr(fmt.Errorf("kafka: produce: %w", err))
 		}
 		if remaining.Add(-1) == 0 {
 			<-s.inflight
@@ -199,7 +222,7 @@ func (s *Sink) Flush(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return s.err()
+	return s.Err()
 }
 
 func (s *Sink) Close() error {

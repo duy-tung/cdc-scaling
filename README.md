@@ -121,3 +121,38 @@ At startup the source validates `binlog_format=ROW` and
 `binlog_row_image=FULL` (and `gtid_mode=ON` when GTID is configured) and
 refuses to start otherwise — MINIMAL row images would silently produce
 wrong payloads and partition keys.
+
+Composite key components are escaped (`|` and `\`), so multi-column keys
+are collision-free. Event IDs are `{gtid}#{tx_order}` where `tx_order` is
+the row's position within the *whole* transaction (filtered-out tables
+included), making IDs identical across hyperloops with different table
+filters.
+
+## Known limitations (by design or deferred)
+
+- **No initial snapshot**: a fresh start begins at the current end of the
+  binlog; existing rows are not captured (incremental snapshot is on the
+  roadmap in PLAN.md).
+- **Ordering is per stable key only** — no global order, no cross-key
+  transaction atomicity, no transaction markers. If a primary-key or
+  override-key column changes value, subsequent events for that entity
+  route to a different partition. Tables without a primary key fall back
+  to whole-row keys, where any update changes the key.
+- **Schema mapping assumes bounded lag around DDL**: column layouts come
+  from live `information_schema`, not a versioned schema history. A
+  source replaying far-past binlog across a rename/drop/reorder can map
+  old rows with the newer schema (the defensive width check catches only
+  column-count changes). A Debezium-style schema history topic is future
+  work.
+- **Resume requires the binlog history to still exist** on the connected
+  server (no recovery from purged binlogs) — monitor checkpoint lag
+  against binlog retention.
+- **Abandoned-shutdown edge**: if a hard cancel times out, Run returns
+  while stuck goroutines are abandoned; a Manager restart then runs
+  against the same sink/source instances. The source self-heals (MySQL
+  disconnects the stale replica with the same server_id) and the sink is
+  shared by design, but truly wedged producers need a process restart.
+- **No auth/TLS on the HTTP API, Kafka, or MySQL connections yet**; run
+  inside a trusted network. No persistence for hyperloops created via the
+  API (they exist until process restart; declare them in YAML for
+  durability).

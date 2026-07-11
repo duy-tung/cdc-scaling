@@ -353,6 +353,107 @@ func TestMySQLTypedColumns(t *testing.T) {
 	}
 }
 
+// TestMySQLReplayFromStaleCheckpoint simulates crash recovery: the state
+// store is rewound to an old position (as if the process died before its
+// latest commits) and the pipeline restarted. Everything after the stale
+// checkpoint must be replayed — with identical event IDs, so downstream
+// dedupe by ID absorbs the duplicates.
+func TestMySQLReplayFromStaleCheckpoint(t *testing.T) {
+	conn := mysqlConn(t)
+	mustExec(t, conn, "DROP TABLE IF EXISTS crash_items")
+	mustExec(t, conn, "CREATE TABLE crash_items (id INT NOT NULL PRIMARY KEY, v INT)")
+
+	topic := "cdc." + testDB + ".crash_items"
+	cluster := kafkaCluster(t, topic)
+	include := []string{testDB + ".crash_items"}
+	store := fileStore(t)
+
+	// Capture the pre-insert position, run the pipeline over 40 rows, stop.
+	seed := state.Position{GTIDSet: executedGTIDSet(t, conn)}
+	if err := store.Save(context.Background(), "it-crash", seed); err != nil {
+		t.Fatal(err)
+	}
+	stop1 := startLoop(t, "it-crash", 5506, include, cluster.ListenAddrs(), store)
+	for i := 1; i <= 40; i++ {
+		mustExec(t, conn, "INSERT INTO crash_items VALUES (?, ?)", i, i)
+	}
+	firstRun := consumeUntil(t, cluster.ListenAddrs(), topic, 60*time.Second, atLeast(40))
+	stop1()
+
+	firstIDs := map[int]string{}
+	for _, e := range firstRun {
+		firstIDs[int(e.After["id"].(float64))] = e.ID
+	}
+
+	// "Crash": rewind the checkpoint to before the 40 inserts, restart.
+	if err := store.Save(context.Background(), "it-crash", seed); err != nil {
+		t.Fatal(err)
+	}
+	startLoop(t, "it-crash", 5507, include, cluster.ListenAddrs(), store)
+
+	// The topic now receives the replay: same rows again. Count raw
+	// (non-deduplicated) copies of row 1 to prove the replay happened, and
+	// verify replayed IDs match the originals exactly.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		replayed := rawRecords(t, cluster.ListenAddrs(), topic)
+		byID := map[string]int{}
+		rowIDs := map[int]string{}
+		for _, e := range replayed {
+			byID[e.ID]++
+			rowIDs[int(e.After["id"].(float64))] = e.ID
+		}
+		if byID[firstIDs[1]] >= 2 && len(rowIDs) == 40 {
+			for row, id := range rowIDs {
+				if firstIDs[row] != id {
+					t.Fatalf("row %d replayed with different ID: %q vs %q — downstream dedupe would break", row, id, firstIDs[row])
+				}
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replay never observed: dup count %d, distinct rows %d", byID[firstIDs[1]], len(rowIDs))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestMySQLTxOrderStableAcrossFilters verifies that tx_order (and thus the
+// GTID-based event ID) denotes the row's position within the whole
+// transaction, independent of this hyperloop's table filter: a pipeline
+// capturing only table B must count table A's rows in the same
+// transaction.
+func TestMySQLTxOrderStableAcrossFilters(t *testing.T) {
+	conn := mysqlConn(t)
+	mustExec(t, conn, "DROP TABLE IF EXISTS txo_a")
+	mustExec(t, conn, "DROP TABLE IF EXISTS txo_b")
+	mustExec(t, conn, "CREATE TABLE txo_a (id INT NOT NULL PRIMARY KEY)")
+	mustExec(t, conn, "CREATE TABLE txo_b (id INT NOT NULL PRIMARY KEY)")
+
+	topic := "cdc." + testDB + ".txo_b"
+	cluster := kafkaCluster(t, topic)
+	// Capture ONLY txo_b.
+	startLoop(t, "it-txo", 5508, []string{testDB + ".txo_b"}, cluster.ListenAddrs(), fileStore(t))
+
+	// One transaction: two rows into A (filtered out), then one into B.
+	mustExec(t, conn, "BEGIN")
+	mustExec(t, conn, "INSERT INTO txo_a VALUES (1), (2)")
+	mustExec(t, conn, "INSERT INTO txo_b VALUES (10)")
+	mustExec(t, conn, "COMMIT")
+
+	events := consumeUntil(t, cluster.ListenAddrs(), topic, 60*time.Second, atLeast(1))
+	e := events[0]
+	if e.Source.GTID == "" {
+		t.Fatal("expected GTID on event")
+	}
+	// B's row is the 3rd row of the transaction; a filter-dependent counter
+	// would have said 1 and produced an ID that collides with A's first row
+	// in a differently-filtered hyperloop.
+	if want := e.Source.GTID + "#3"; e.ID != want {
+		t.Fatalf("event ID = %q, want %q (tx_order must count filtered-out rows)", e.ID, want)
+	}
+}
+
 // TestMySQLSchemaChange alters the table mid-stream (add a column) and
 // verifies subsequent events carry the new schema.
 func TestMySQLSchemaChange(t *testing.T) {

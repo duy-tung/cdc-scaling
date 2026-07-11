@@ -324,9 +324,19 @@ func (ts *txnState) commit(logPos uint32) {
 }
 
 func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *replication.RowsEvent, op event.Op, ts *txnState, registry *schemaRegistry, out chan<- []*event.NomiosEvent) error {
+	step := 1
+	if op == event.OpUpdate {
+		step = 2 // update rows come in (before, after) pairs
+	}
 	db, table := string(re.Table.Schema), string(re.Table.Table)
 	fqtn := db + "." + table
 	if !s.filter.match(fqtn) {
+		// Filtered-out rows still advance txOrder: an event's tx_order (and
+		// therefore its GTID-based ID) must denote the row's position within
+		// the whole transaction, not within this hyperloop's capture subset —
+		// otherwise two hyperloops with different table filters would assign
+		// the same ID to different rows.
+		ts.txOrder += len(re.Rows) / step
 		return nil
 	}
 	schema, err := registry.Get(db, table)
@@ -343,10 +353,6 @@ func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *
 	}
 
 	occurred := time.Unix(int64(ev.Header.Timestamp), 0)
-	step := 1
-	if op == event.OpUpdate {
-		step = 2 // update rows come in (before, after) pairs
-	}
 	// All rows of one binlog event travel as one micro-batch: a single
 	// channel send instead of one per row.
 	batch := make([]*event.NomiosEvent, 0, len(re.Rows)/step)

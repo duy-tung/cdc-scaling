@@ -115,3 +115,23 @@ func TestKeyFromColumns(t *testing.T) {
 		t.Fatalf("keyless fallback not deterministic: %q vs %q", a, b)
 	}
 }
+
+// TestKeyEscapingPreventsCollisions: composite key components containing
+// the separator must not conflate distinct entities — ("a|b","c") and
+// ("a","b|c") were identical keys before escaping.
+func TestKeyEscapingPreventsCollisions(t *testing.T) {
+	k1 := KeyFromColumns("db.t", map[string]any{"x": "a|b", "y": "c"}, []string{"x", "y"})
+	k2 := KeyFromColumns("db.t", map[string]any{"x": "a", "y": "b|c"}, []string{"x", "y"})
+	if k1 == k2 {
+		t.Fatalf("distinct composite keys collide: %q", k1)
+	}
+	k3 := KeyFromColumns("db.t", map[string]any{"x": `a\`, "y": "|c"}, []string{"x", "y"})
+	k4 := KeyFromColumns("db.t", map[string]any{"x": "a", "y": `\|c`}, []string{"x", "y"})
+	if k3 == k4 {
+		t.Fatalf("escape-char keys collide: %q", k3)
+	}
+	// Same values always give the same key.
+	if k1 != KeyFromColumns("db.t", map[string]any{"x": "a|b", "y": "c"}, []string{"x", "y"}) {
+		t.Fatal("escaped key not deterministic")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 )
@@ -40,11 +41,22 @@ func NewMySQLStore(addr, user, password, database string) (*MySQLStore, error) {
 	return s, nil
 }
 
+// ioTimeout bounds every state-store network operation. The Store API
+// takes contexts, but go-mysql's client has no context-aware Execute —
+// socket deadlines are what actually guarantee a stuck connection cannot
+// hang checkpoint commits or shutdown indefinitely.
+const ioTimeout = 5 * time.Second
+
 func (s *MySQLStore) reconnect() error {
 	if s.conn != nil {
 		_ = s.conn.Close()
 	}
-	conn, err := client.Connect(s.addr, s.user, s.password, s.database)
+	conn, err := client.ConnectWithTimeout(s.addr, s.user, s.password, s.database, ioTimeout,
+		func(c *client.Conn) error {
+			c.ReadTimeout = ioTimeout
+			c.WriteTimeout = ioTimeout
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("state: connect %s: %w", s.addr, err)
 	}

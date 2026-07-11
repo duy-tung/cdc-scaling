@@ -198,6 +198,12 @@ func (h *Hyperloop) Run(ctx context.Context) error {
 func (h *Hyperloop) run(ctx context.Context) error {
 	// Load last committed state: on restart/deploy/crash the hyperloop
 	// continues the event stream from exactly the saved position.
+	// A restarted run replays everything after the checkpoint, so a sticky
+	// error from the previous run's sink must not fail this run instantly.
+	if r, ok := h.deps.Sink.(interface{ Reset() }); ok {
+		r.Reset()
+	}
+
 	pos, err := h.deps.Store.Load(ctx, h.cfg.ID)
 	if err != nil {
 		return fmt.Errorf("hyperloop: load state: %w", err)
@@ -297,7 +303,7 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	commitWg.Add(1)
 	go func() {
 		defer commitWg.Done()
-		h.runCommitter(commitStop, tracker)
+		h.runCommitter(commitStop, tracker, fail)
 	}()
 
 	h.status.Store(StatusRunning)
@@ -434,13 +440,23 @@ func drainBatch(ctx context.Context, q <-chan []*event.NomiosEvent, buf []*event
 	return batch, true
 }
 
-// runCommitter persists the checkpoint every CommitInterval when it moved.
-func (h *Hyperloop) runCommitter(stop <-chan struct{}, tracker *state.Tracker) {
+// runCommitter persists the checkpoint every CommitInterval when it moved,
+// and doubles as the async-error watchdog: a produce failure on an
+// otherwise idle pipeline is reported by the sink only on the next call,
+// so the committer polls the sink's sticky error and fails the pipeline
+// promptly instead of letting it show "running" forever.
+func (h *Hyperloop) runCommitter(stop <-chan struct{}, tracker *state.Tracker, fail func(error)) {
 	ticker := time.NewTicker(h.cfg.CommitInterval)
 	defer ticker.Stop()
+	sinkErr, pollable := h.deps.Sink.(interface{ Err() error })
 	for {
 		select {
 		case <-ticker.C:
+			if pollable {
+				if err := sinkErr.Err(); err != nil {
+					fail(fmt.Errorf("sink: %w", err))
+				}
+			}
 			if ckpt, ok := tracker.TakeDirty(); ok {
 				cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				if err := h.deps.Store.Save(cctx, h.cfg.ID, ckpt); err != nil {

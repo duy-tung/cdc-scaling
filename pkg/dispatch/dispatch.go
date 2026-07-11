@@ -63,6 +63,22 @@ func KeyFromColumns(fqtn string, row map[string]any, cols []string) string {
 	return string(b)
 }
 
+// appendEscaped writes s with the key separator '|' and the escape char
+// '\' escaped, so multi-column keys are collision-free: without escaping,
+// ("a|b","c") and ("a","b|c") would render to the same key and conflate
+// two distinct entities into one Kafka key.
+func appendEscaped(b []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '|', '\\':
+			b = append(b, '\\', c)
+		default:
+			b = append(b, c)
+		}
+	}
+	return b
+}
+
 // appendKeyValue renders a column value into a key without fmt reflection
 // (fmt.Sprintf was 6.6% of pipeline allocations). The rendering only needs
 // to be deterministic and collision-free per column, not human-canonical.
@@ -71,11 +87,11 @@ func appendKeyValue(b []byte, v any) []byte {
 	case nil:
 		return b
 	case string:
-		return append(b, x...)
+		return appendEscaped(b, x)
 	case []byte:
-		return append(b, x...)
+		return appendEscaped(b, string(x))
 	case json.RawMessage:
-		return append(b, x...)
+		return appendEscaped(b, string(x))
 	case int:
 		return strconv.AppendInt(b, int64(x), 10)
 	case int8:
@@ -103,7 +119,7 @@ func appendKeyValue(b []byte, v any) []byte {
 	case float64:
 		return strconv.AppendFloat(b, x, 'g', -1, 64)
 	default:
-		return fmt.Appendf(b, "%v", v)
+		return appendEscaped(b, fmt.Sprintf("%v", v))
 	}
 }
 

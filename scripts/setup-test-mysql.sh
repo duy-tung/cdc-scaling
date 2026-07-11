@@ -7,10 +7,11 @@
 set -euo pipefail
 
 mysql <<'EOF'
-SET GLOBAL enforce_gtid_consistency = ON;
+SET PERSIST enforce_gtid_consistency = ON;
 SET GLOBAL gtid_mode = OFF_PERMISSIVE;
 SET GLOBAL gtid_mode = ON_PERMISSIVE;
 SET GLOBAL gtid_mode = ON;
+SET PERSIST gtid_mode = ON;
 
 CREATE USER IF NOT EXISTS 'nomios'@'%' IDENTIFIED BY 'nomios-test';
 GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON *.* TO 'nomios'@'%';

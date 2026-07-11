@@ -3,6 +3,7 @@ package mysql
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/client"
 )
@@ -50,11 +51,21 @@ func newSchemaRegistry(addr, user, password string) (*schemaRegistry, error) {
 	return r, nil
 }
 
+// registryTimeout bounds schema lookups: a hung information_schema query
+// would otherwise stall the source (and transitively the whole pipeline)
+// with no context to cancel it.
+const registryTimeout = 10 * time.Second
+
 func (r *schemaRegistry) reconnect() error {
 	if r.conn != nil {
 		_ = r.conn.Close()
 	}
-	conn, err := client.Connect(r.addr, r.user, r.password, "information_schema")
+	conn, err := client.ConnectWithTimeout(r.addr, r.user, r.password, "information_schema", registryTimeout,
+		func(c *client.Conn) error {
+			c.ReadTimeout = registryTimeout
+			c.WriteTimeout = registryTimeout
+			return nil
+		})
 	if err != nil {
 		return fmt.Errorf("schema registry: connect %s: %w", r.addr, err)
 	}

@@ -87,6 +87,22 @@ func (h *Hyperloop) AutoStartEnabled() bool {
 	return h.AutoStart == nil || *h.AutoStart
 }
 
+// stateCredentials resolves the MySQL state-store connection, defaulting
+// to the source database. The source's port default (3306) is applied
+// here too: the source config's zero port would otherwise leak into the
+// state address as "host:0".
+func (h *Hyperloop) stateCredentials() (addr, user, password string) {
+	if h.State.Addr != "" {
+		return h.State.Addr, h.State.User, h.State.Password
+	}
+	port := h.Source.MySQL.Port
+	if port == 0 {
+		port = 3306
+	}
+	return fmt.Sprintf("%s:%d", h.Source.MySQL.Host, port),
+		h.Source.MySQL.User, h.Source.MySQL.Password
+}
+
 // Build constructs a runnable hyperloop from its declarative definition.
 func (h *Hyperloop) Build(logger *slog.Logger) (*hyperloop.Hyperloop, error) {
 	if h.ID == "" {
@@ -111,15 +127,7 @@ func (h *Hyperloop) Build(logger *slog.Logger) (*hyperloop.Hyperloop, error) {
 	case "file":
 		store, err = state.NewFileStore(h.State.Dir)
 	case "mysql", "":
-		addr := h.State.Addr
-		user := h.State.User
-		password := h.State.Password
-		if addr == "" {
-			// Default to the source database for state storage.
-			addr = fmt.Sprintf("%s:%d", h.Source.MySQL.Host, h.Source.MySQL.Port)
-			user = h.Source.MySQL.User
-			password = h.Source.MySQL.Password
-		}
+		addr, user, password := h.stateCredentials()
 		db := h.State.Database
 		if db == "" {
 			return nil, fmt.Errorf("config: hyperloop %s: state.database is required for the mysql store", h.ID)

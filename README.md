@@ -99,7 +99,25 @@ optimization passes documented in [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md)):
 
 - **No gaps**: the committed checkpoint never passes an unpublished event;
   resume replays at most the in-progress transaction.
-- **At-least-once**: consumers must dedupe (event `id` is deterministic
-  from binlog coordinates).
+- **At-least-once**: consumers must dedupe by event `id`. With GTID
+  enabled the id is `{gtid}#{tx_order}` — stable across MySQL failover;
+  without GTID it falls back to `{file}:{pos}:{row}` coordinates.
 - **Per-key order**: same key → same buffer queue → same publisher → same
-  Kafka partition.
+  Kafka partition. The key follows the *current* row image (After for
+  insert/update, Before for delete): if a primary-key or override-key
+  column value changes, subsequent events route to a different partition.
+
+## Wire format notes
+
+Values are mapped type-faithfully using `information_schema` (the binlog
+alone cannot distinguish TEXT from BLOB):
+
+- JSON columns arrive as **nested JSON documents**, not quoted strings.
+- Binary columns (BLOB/BINARY/VARBINARY/BIT/geometry) arrive **base64
+  encoded** (same convention as `encoding/json`).
+- Character columns arrive as plain strings.
+
+At startup the source validates `binlog_format=ROW` and
+`binlog_row_image=FULL` (and `gtid_mode=ON` when GTID is configured) and
+refuses to start otherwise — MINIMAL row images would silently produce
+wrong payloads and partition keys.

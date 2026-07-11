@@ -8,6 +8,7 @@ package mysql
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -79,6 +80,10 @@ func New(cfg Config, logger *slog.Logger) *Source {
 
 // Start implements source.Source.
 func (s *Source) Start(ctx context.Context, from state.Position, out chan<- []*event.NomiosEvent) error {
+	if err := s.validateServer(); err != nil {
+		return err
+	}
+
 	registry, err := newSchemaRegistry(s.cfg.addr(), s.cfg.User, s.cfg.Password)
 	if err != nil {
 		return err
@@ -151,6 +156,58 @@ func (s *Source) resolveStart(from state.Position) (startPoint, error) {
 		return startPoint{}, err
 	}
 	return startPoint{file: file, offset: pos}, nil
+}
+
+// validateServer fails fast when the MySQL server is configured in a way
+// that would silently corrupt payloads instead of erroring later:
+// binlog_format must be ROW (statement/mixed events carry no row images)
+// and binlog_row_image must be FULL — with MINIMAL, go-mysql still decodes
+// full-width rows but fills omitted columns with nil, so events would
+// carry wrong nulls and, worse, wrong partition keys, undetected.
+func (s *Source) validateServer() error {
+	conn, err := client.Connect(s.cfg.addr(), s.cfg.User, s.cfg.Password, "")
+	if err != nil {
+		return fmt.Errorf("mysql source: connect for validation: %w", err)
+	}
+	defer conn.Close()
+
+	get := func(name string) (string, error) {
+		r, err := conn.Execute("SHOW VARIABLES LIKE '" + name + "'")
+		if err != nil {
+			return "", fmt.Errorf("mysql source: show variables %s: %w", name, err)
+		}
+		defer r.Close()
+		if r.RowNumber() == 0 {
+			return "", nil
+		}
+		v, _ := r.GetString(0, 1)
+		return v, nil
+	}
+
+	format, err := get("binlog_format")
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(format, "ROW") {
+		return fmt.Errorf("mysql source: binlog_format is %q, need ROW", format)
+	}
+	image, err := get("binlog_row_image")
+	if err != nil {
+		return err
+	}
+	if image != "" && !strings.EqualFold(image, "FULL") {
+		return fmt.Errorf("mysql source: binlog_row_image is %q, need FULL (MINIMAL/NOBLOB would silently produce wrong row images and partition keys)", image)
+	}
+	if s.cfg.GTID {
+		mode, err := get("gtid_mode")
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(mode, "ON") {
+			return fmt.Errorf("mysql source: gtid requested but gtid_mode is %q", mode)
+		}
+	}
+	return nil
 }
 
 // masterStatus queries the server's current binlog coordinates.
@@ -297,18 +354,28 @@ func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *
 		var before, after map[string]any
 		switch op {
 		case event.OpInsert:
-			after = mapRow(schema.Columns, re.Rows[i])
+			after = mapRow(schema, re.Rows[i])
 		case event.OpDelete:
-			before = mapRow(schema.Columns, re.Rows[i])
+			before = mapRow(schema, re.Rows[i])
 		case event.OpUpdate:
-			before = mapRow(schema.Columns, re.Rows[i])
-			after = mapRow(schema.Columns, re.Rows[i+1])
+			before = mapRow(schema, re.Rows[i])
+			after = mapRow(schema, re.Rows[i+1])
 		}
 
 		ts.seq++
 		ts.txOrder++
+		// Event IDs must be stable across MySQL failover so downstream
+		// dedupe keeps working: a GTID survives a master change, while the
+		// same transaction can land at a different file/offset on the new
+		// master. File coordinates are only the non-GTID fallback.
+		var id string
+		if ts.pendingGTID != "" {
+			id = fmt.Sprintf("%s#%d", ts.pendingGTID, ts.txOrder)
+		} else {
+			id = fmt.Sprintf("%s:%d:%d", ts.currentFile, ev.Header.LogPos, i/step)
+		}
 		ne := &event.NomiosEvent{
-			ID:         fmt.Sprintf("%s:%d:%d", ts.currentFile, ev.Header.LogPos, i/step),
+			ID:         id,
 			Op:         op,
 			Before:     before,
 			After:      after,
@@ -345,20 +412,50 @@ func (s *Source) emitRows(ctx context.Context, ev *replication.BinlogEvent, re *
 	}
 }
 
-// mapRow maps positional binlog values to named columns, normalizing
-// []byte values (BLOB/TEXT and some charsets) to string for JSON.
-func mapRow(cols []string, vals []any) map[string]any {
+// mapRow maps positional binlog values to named columns, interpreting
+// []byte values by the column's information_schema type: character data
+// becomes string, JSON documents stay raw JSON (serialized as nested
+// objects, not quoted strings), and true binary data stays []byte (the
+// serializer emits it as base64). The binlog alone cannot make these
+// distinctions — TEXT and BLOB share a wire type.
+func mapRow(schema *TableSchema, vals []any) map[string]any {
 	n := len(vals)
-	if len(cols) < n {
-		n = len(cols)
+	if len(schema.Columns) < n {
+		n = len(schema.Columns)
 	}
 	m := make(map[string]any, n)
 	for i := 0; i < n; i++ {
 		v := vals[i]
-		if b, ok := v.([]byte); ok {
-			v = string(b)
+		// go-mysql is inconsistent about []byte vs string across column
+		// types and versions (e.g. v1.15 returns JSON documents and
+		// VARBINARY as string), so both representations are normalized by
+		// the schema kind.
+		switch schema.Kinds[i] {
+		case KindJSON:
+			switch b := v.(type) {
+			case []byte:
+				if len(b) == 0 {
+					v = nil // empty JSON binary means SQL-inserted empty value
+				} else {
+					v = json.RawMessage(b)
+				}
+			case string:
+				if b == "" {
+					v = nil
+				} else {
+					v = json.RawMessage(b)
+				}
+			}
+		case KindBinary:
+			if s, ok := v.(string); ok {
+				v = []byte(s) // serialized as base64 downstream
+			}
+		default:
+			if b, ok := v.([]byte); ok {
+				v = string(b)
+			}
 		}
-		m[cols[i]] = v
+		m[schema.Columns[i]] = v
 	}
 	return m
 }

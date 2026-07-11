@@ -10,6 +10,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -72,6 +73,8 @@ func appendKeyValue(b []byte, v any) []byte {
 	case string:
 		return append(b, x...)
 	case []byte:
+		return append(b, x...)
+	case json.RawMessage:
 		return append(b, x...)
 	case int:
 		return strconv.AppendInt(b, int64(x), 10)

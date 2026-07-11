@@ -13,7 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/duy-tung/cdc-scaling/pkg/config"
+	"github.com/duy-tung/cdc-scaling/pkg/metrics"
 	"github.com/duy-tung/cdc-scaling/pkg/server"
 )
 
@@ -56,6 +59,10 @@ func main() {
 			log.Info("hyperloop started", "hyperloop", hl.ID())
 		}
 	}
+
+	metricsCtx, metricsCancel := context.WithCancel(context.Background())
+	defer metricsCancel()
+	go mgr.PollMetrics(metricsCtx, metrics.New(prometheus.DefaultRegisterer), 5*time.Second)
 
 	httpSrv := &http.Server{Addr: cfg.Listen, Handler: mgr.Handler()}
 	go func() {

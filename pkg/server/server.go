@@ -15,6 +15,7 @@ import (
 
 	"github.com/duy-tung/cdc-scaling/pkg/config"
 	"github.com/duy-tung/cdc-scaling/pkg/hyperloop"
+	"github.com/duy-tung/cdc-scaling/pkg/metrics"
 )
 
 // managed is one registered hyperloop and its run lifecycle.
@@ -30,13 +31,24 @@ type Manager struct {
 	mu    sync.Mutex
 	loops map[string]*managed
 	log   *slog.Logger
+
+	// Restart policy for failed hyperloops: exponential backoff starting
+	// at RestartBackoff (doubling, capped at 1 minute), giving up after
+	// MaxRestarts consecutive failures. A clean stop never restarts.
+	MaxRestarts    int
+	RestartBackoff time.Duration
 }
 
 func NewManager(logger *slog.Logger) *Manager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{loops: make(map[string]*managed), log: logger}
+	return &Manager{
+		loops:          make(map[string]*managed),
+		log:            logger,
+		MaxRestarts:    5,
+		RestartBackoff: time.Second,
+	}
 }
 
 // Register adds a hyperloop without starting it.
@@ -78,8 +90,30 @@ func (m *Manager) Start(id string) error {
 	l.cancel, l.done = cancel, done
 	go func() {
 		defer close(done)
-		if err := l.hl.Run(ctx); err != nil {
-			m.log.Error("hyperloop exited with error", "hyperloop", id, "err", err)
+		backoff := m.RestartBackoff
+		for attempt := 0; ; attempt++ {
+			err := l.hl.Run(ctx)
+			if err == nil || ctx.Err() != nil {
+				if err != nil && ctx.Err() == nil {
+					m.log.Error("hyperloop exited with error", "hyperloop", id, "err", err)
+				}
+				return
+			}
+			if attempt >= m.MaxRestarts {
+				m.log.Error("hyperloop failed; restart budget exhausted",
+					"hyperloop", id, "attempts", attempt+1, "err", err)
+				return
+			}
+			m.log.Warn("hyperloop failed; restarting",
+				"hyperloop", id, "attempt", attempt+1, "backoff", backoff, "err", err)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			if backoff *= 2; backoff > time.Minute {
+				backoff = time.Minute
+			}
 		}
 	}()
 	return nil
@@ -127,6 +161,29 @@ func (m *Manager) StopAll(ctx context.Context) {
 	wg.Wait()
 }
 
+// PollMetrics feeds hyperloop status snapshots into the Prometheus
+// collectors every interval until ctx ends. Run it as a goroutine.
+func (m *Manager) PollMetrics(ctx context.Context, nm *metrics.Nomios, interval time.Duration) {
+	if nm == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			for _, s := range m.Statuses() {
+				nm.Observe(s)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // Statuses returns status reports for all hyperloops.
 func (m *Manager) Statuses() []hyperloop.StatusReport {
 	m.mu.Lock()
@@ -143,10 +200,23 @@ func (m *Manager) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusOK) // liveness: the process serves HTTP
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Readiness reflects hyperloop health: any failed hyperloop makes the
+	// node not-ready so orchestrators and load balancers can see it.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
+		var failed []string
+		for _, s := range m.Statuses() {
+			if s.Status == hyperloop.StatusFailed {
+				failed = append(failed, s.ID)
+			}
+		}
+		if len(failed) > 0 {
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]any{"ready": false, "failed_hyperloops": failed})
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})

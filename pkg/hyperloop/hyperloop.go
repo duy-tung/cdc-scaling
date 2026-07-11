@@ -122,14 +122,21 @@ type Hyperloop struct {
 	tracker    atomic.Pointer[state.Tracker]
 	published  atomic.Uint64
 	lastErr    atomic.Value // string
+	persisted  atomic.Value // state.Position: last successfully saved
 }
 
 // StatusReport is a point-in-time view of a hyperloop for monitoring.
 type StatusReport struct {
-	ID          string         `json:"id"`
-	Status      Status         `json:"status"`
-	Published   uint64         `json:"published_events"`
+	ID        string `json:"id"`
+	Status    Status `json:"status"`
+	Published uint64 `json:"published_events"`
+	// Checkpoint is the in-memory committable position (everything up to
+	// it is durably published); Persisted is the last position actually
+	// written to the state store. They differ when a state save is behind
+	// or failing — resume happens from Persisted, so monitoring must see
+	// both.
 	Checkpoint  state.Position `json:"checkpoint"`
+	Persisted   state.Position `json:"persisted_checkpoint"`
 	QueueDepths []int          `json:"queue_depths,omitempty"`
 	LastError   string         `json:"last_error,omitempty"`
 }
@@ -164,6 +171,9 @@ func (h *Hyperloop) Status() StatusReport {
 	if t := h.tracker.Load(); t != nil {
 		rep.Checkpoint, _ = t.Checkpoint()
 	}
+	if p, ok := h.persisted.Load().(state.Position); ok {
+		rep.Persisted = p
+	}
 	if d := h.dispatcher.Load(); d != nil {
 		rep.QueueDepths = d.Depths()
 	}
@@ -192,6 +202,7 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("hyperloop: load state: %w", err)
 	}
+	h.persisted.Store(pos)
 	h.log.Info("starting", "from_gtid", pos.GTIDSet, "from_file", pos.File, "from_offset", pos.Offset)
 
 	tracker := state.NewTracker()
@@ -220,20 +231,32 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	hardCtx, cancelHard := context.WithCancel(context.Background())
 	defer cancelHard()
 
+	// firstErr is mutex-guarded (not sync.Once) because the abandoned-
+	// shutdown path reads it while late goroutines may still be failing.
 	var (
-		errOnce  sync.Once
+		errMu    sync.Mutex
 		firstErr error
 	)
 	fail := func(err error) {
 		if err == nil || errors.Is(err, context.Canceled) {
 			return
 		}
-		errOnce.Do(func() {
+		errMu.Lock()
+		first := firstErr == nil
+		if first {
 			firstErr = err
+		}
+		errMu.Unlock()
+		if first {
 			h.log.Error("component failed, aborting pipeline", "err", err)
 			cancelSrc()
 			cancelHard()
-		})
+		}
+	}
+	getErr := func() error {
+		errMu.Lock()
+		defer errMu.Unlock()
+		return firstErr
 	}
 
 	var wg sync.WaitGroup
@@ -282,6 +305,7 @@ func (h *Hyperloop) run(ctx context.Context) error {
 	finished := make(chan struct{})
 	go func() { wg.Wait(); close(finished) }()
 
+	abandoned := false
 	select {
 	case <-ctx.Done():
 		// Graceful stop: stop the source, then let the pipeline drain.
@@ -293,23 +317,38 @@ func (h *Hyperloop) run(ctx context.Context) error {
 		case <-time.After(h.cfg.ShutdownTimeout):
 			h.log.Warn("drain timed out, hard-cancelling", "timeout", h.cfg.ShutdownTimeout)
 			cancelHard()
-			<-finished
+			// Shutdown must be bounded even if a component ignores its
+			// context (e.g. a produce stuck resolving an in-flight
+			// idempotent request). After a second timeout the goroutines
+			// are abandoned: state stays at-least-once safe because the
+			// checkpoint only ever covers acknowledged events.
+			select {
+			case <-finished:
+			case <-time.After(h.cfg.ShutdownTimeout):
+				h.log.Error("pipeline goroutines did not exit after hard cancel; abandoning them", "timeout", h.cfg.ShutdownTimeout)
+				abandoned = true
+			}
 		}
 	case <-finished:
 		// Source ended on its own (fatal error or finite stream).
 		h.status.Store(StatusStopping)
 	}
 
+	runErr := getErr()
+
 	// All workers have submitted their last batches; wait for the sink's
 	// in-flight publishes to become durable so the final checkpoint covers
 	// them. Skipping this on error/hard-cancel is safe (at-least-once).
-	if firstErr == nil {
+	if runErr == nil && !abandoned {
 		fctx, fcancel := context.WithTimeout(context.Background(), h.cfg.ShutdownTimeout)
 		if err := h.deps.Sink.Flush(fctx); err != nil {
 			h.log.Error("sink flush failed", "err", err)
-			firstErr = err
+			runErr = err
 		}
 		fcancel()
+	}
+	if abandoned && runErr == nil {
+		runErr = fmt.Errorf("hyperloop: shutdown timed out after 2x%s; pipeline goroutines abandoned", h.cfg.ShutdownTimeout)
 	}
 
 	close(commitStop)
@@ -321,14 +360,15 @@ func (h *Hyperloop) run(ctx context.Context) error {
 		defer cancel()
 		if err := h.deps.Store.Save(cctx, h.cfg.ID, ckpt); err != nil {
 			h.log.Error("final state commit failed", "err", err)
-			if firstErr == nil {
-				firstErr = err
+			if runErr == nil {
+				runErr = err
 			}
 		} else {
+			h.persisted.Store(ckpt)
 			h.log.Info("final state committed", "seq", ckpt.SeqNo, "gtid", ckpt.GTIDSet, "file", ckpt.File, "offset", ckpt.Offset)
 		}
 	}
-	return firstErr
+	return runErr
 }
 
 // runPublisher drains one buffer queue in batches and submits each batch
@@ -405,6 +445,8 @@ func (h *Hyperloop) runCommitter(stop <-chan struct{}, tracker *state.Tracker) {
 				cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				if err := h.deps.Store.Save(cctx, h.cfg.ID, ckpt); err != nil {
 					h.log.Error("state commit failed", "err", err)
+				} else {
+					h.persisted.Store(ckpt)
 				}
 				cancel()
 			}

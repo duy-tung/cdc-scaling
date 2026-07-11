@@ -62,7 +62,7 @@ func assertSemanticallyEqual(t *testing.T, e *event.NomiosEvent) {
 
 // randomValue produces the value types the MySQL source emits.
 func randomValue(r *rand.Rand) any {
-	switch r.Intn(10) {
+	switch r.Intn(12) {
 	case 0:
 		return nil
 	case 1:
@@ -81,6 +81,15 @@ func randomValue(r *rand.Rand) any {
 		return randString(r, 0, 64) // includes escapes
 	case 8:
 		return float32(r.NormFloat64())
+	case 9:
+		// binary column value: arbitrary bytes, expected base64 on the wire
+		b := make([]byte, r.Intn(24))
+		r.Read(b)
+		return b
+	case 10:
+		// JSON column value: raw document embedded as-is
+		docs := []string{`{"a":1,"b":[true,null]}`, `[1,2,3]`, `"str"`, `42`, `null`, `{"nested":{"x":1.5}}`}
+		return json.RawMessage(docs[r.Intn(len(docs))])
 	default:
 		return r.Intn(1000)
 	}

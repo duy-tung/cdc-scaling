@@ -3,7 +3,9 @@
 package integration
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"testing"
@@ -82,14 +84,21 @@ func executedGTIDSet(t *testing.T, conn *client.Conn) string {
 	return set
 }
 
-// startLoop builds and starts a hyperloop over the given tables, returning
-// a stop function that gracefully stops it and asserts a clean exit.
-func startLoop(t *testing.T, id string, serverID uint32, include []string, brokers []string, stateDir string) (stop func()) {
+// fileStore is the default state store for tests that don't exercise
+// persistence specifics.
+func fileStore(t *testing.T) state.Store {
 	t.Helper()
-	store, err := state.NewFileStore(stateDir)
+	s, err := state.NewFileStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
+	return s
+}
+
+// startLoop builds and starts a hyperloop over the given tables, returning
+// a stop function that gracefully stops it and asserts a clean exit.
+func startLoop(t *testing.T, id string, serverID uint32, include []string, brokers []string, store state.Store) (stop func()) {
+	t.Helper()
 	// Pre-seed the state with the current position if none is saved yet.
 	if p, err := store.Load(context.Background(), id); err != nil {
 		t.Fatal(err)
@@ -164,7 +173,7 @@ func TestMySQLCaptureInsertUpdateDelete(t *testing.T) {
 
 	topic := "cdc." + testDB + ".items"
 	cluster := kafkaCluster(t, topic)
-	stop := startLoop(t, "it-crud", 5501, []string{testDB + ".items"}, cluster.ListenAddrs(), t.TempDir())
+	stop := startLoop(t, "it-crud", 5501, []string{testDB + ".items"}, cluster.ListenAddrs(), fileStore(t))
 
 	// 60 inserts (some multi-row), 20 updates, 10 deletes = 90 change events.
 	for i := 1; i <= 60; i += 3 {
@@ -241,11 +250,20 @@ func TestMySQLResumeAfterRestart(t *testing.T) {
 
 	topic := "cdc." + testDB + ".resume_items"
 	cluster := kafkaCluster(t, topic)
-	stateDir := t.TempDir()
 	include := []string{testDB + ".resume_items"}
 
+	// The resume test doubles as the MySQLStore integration test: state is
+	// persisted in the source database itself (the production default) and
+	// must survive across the two pipeline runs.
+	store, err := state.NewMySQLStore(mysqlAddr(), mysqlUser(), mysqlPassword(), testDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	mustExec(t, conn, "DELETE FROM nomios_state WHERE hyperloop_id = 'it-resume'")
+
 	// Phase 1: capture 30 inserts, then stop gracefully (commits state).
-	stop1 := startLoop(t, "it-resume", 5502, include, cluster.ListenAddrs(), stateDir)
+	stop1 := startLoop(t, "it-resume", 5502, include, cluster.ListenAddrs(), store)
 	for i := 1; i <= 30; i++ {
 		mustExec(t, conn, "INSERT INTO resume_items VALUES (?, 'a')", i)
 	}
@@ -259,7 +277,7 @@ func TestMySQLResumeAfterRestart(t *testing.T) {
 
 	// Phase 2: restart from the checkpoint; the 40 downtime rows must all
 	// arrive (replays of phase-1 rows are legal, gaps are not).
-	startLoop(t, "it-resume", 5503, include, cluster.ListenAddrs(), stateDir)
+	startLoop(t, "it-resume", 5503, include, cluster.ListenAddrs(), store)
 	events := consumeUntil(t, cluster.ListenAddrs(), topic, 60*time.Second, func(seen map[string]envelope) bool {
 		ids := map[int]bool{}
 		for _, e := range seen {
@@ -284,6 +302,57 @@ func TestMySQLResumeAfterRestart(t *testing.T) {
 	}
 }
 
+// TestMySQLTypedColumns verifies the type-faithful wire mapping: JSON
+// columns arrive as nested JSON documents (not quoted strings), binary
+// columns as base64, and TEXT as plain strings — distinctions the binlog
+// alone cannot make (TEXT and BLOB share a wire type).
+func TestMySQLTypedColumns(t *testing.T) {
+	conn := mysqlConn(t)
+	mustExec(t, conn, "DROP TABLE IF EXISTS typed_items")
+	mustExec(t, conn, `CREATE TABLE typed_items (
+		id INT NOT NULL PRIMARY KEY,
+		doc JSON,
+		bin VARBINARY(16),
+		txt TEXT
+	)`)
+
+	topic := "cdc." + testDB + ".typed_items"
+	cluster := kafkaCluster(t, topic)
+	startLoop(t, "it-typed", 5505, []string{testDB + ".typed_items"}, cluster.ListenAddrs(), fileStore(t))
+
+	mustExec(t, conn,
+		`INSERT INTO typed_items VALUES (1, '{"a": 1, "b": [true, null]}', X'DEADBEEF', 'hello world')`)
+	mustExec(t, conn, `INSERT INTO typed_items VALUES (2, NULL, NULL, NULL)`)
+
+	events := consumeUntil(t, cluster.ListenAddrs(), topic, 60*time.Second, atLeast(2))
+	for _, e := range events {
+		switch int(e.After["id"].(float64)) {
+		case 1:
+			doc, ok := e.After["doc"].(map[string]any)
+			if !ok {
+				t.Fatalf("JSON column arrived as %T (%v), want nested object", e.After["doc"], e.After["doc"])
+			}
+			if doc["a"].(float64) != 1 {
+				t.Fatalf("JSON payload wrong: %v", doc)
+			}
+			bin, _ := e.After["bin"].(string)
+			raw, err := base64.StdEncoding.DecodeString(bin)
+			if err != nil || !bytes.Equal(raw, []byte{0xDE, 0xAD, 0xBE, 0xEF}) {
+				t.Fatalf("binary column = %q (decoded %x, err %v), want base64 of deadbeef", bin, raw, err)
+			}
+			if e.After["txt"] != "hello world" {
+				t.Fatalf("text column = %v", e.After["txt"])
+			}
+		case 2:
+			for _, col := range []string{"doc", "bin", "txt"} {
+				if e.After[col] != nil {
+					t.Fatalf("column %s = %v, want null", col, e.After[col])
+				}
+			}
+		}
+	}
+}
+
 // TestMySQLSchemaChange alters the table mid-stream (add a column) and
 // verifies subsequent events carry the new schema.
 func TestMySQLSchemaChange(t *testing.T) {
@@ -293,7 +362,7 @@ func TestMySQLSchemaChange(t *testing.T) {
 
 	topic := "cdc." + testDB + ".ddl_items"
 	cluster := kafkaCluster(t, topic)
-	startLoop(t, "it-ddl", 5504, []string{testDB + ".ddl_items"}, cluster.ListenAddrs(), t.TempDir())
+	startLoop(t, "it-ddl", 5504, []string{testDB + ".ddl_items"}, cluster.ListenAddrs(), fileStore(t))
 
 	for i := 1; i <= 5; i++ {
 		mustExec(t, conn, "INSERT INTO ddl_items (id, name) VALUES (?, 'old')", i)

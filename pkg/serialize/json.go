@@ -1,6 +1,7 @@
 package serialize
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -151,8 +152,24 @@ func appendValue(b []byte, v any) ([]byte, error) {
 		return append(b, "null"...), nil
 	case string:
 		return appendJSONString(b, x), nil
+	case json.RawMessage:
+		// Pre-validated JSON (MySQL JSON columns): embed as-is so documents
+		// arrive as nested objects, not quoted strings.
+		if len(x) == 0 {
+			return append(b, "null"...), nil
+		}
+		return append(b, x...), nil
 	case []byte:
-		return appendJSONString(b, string(x)), nil
+		// True binary data (BLOB/VARBINARY/...): base64, exactly like
+		// encoding/json.
+		if x == nil {
+			return append(b, "null"...), nil
+		}
+		b = append(b, '"')
+		n := base64.StdEncoding.EncodedLen(len(x))
+		b = append(b, make([]byte, n)...)
+		base64.StdEncoding.Encode(b[len(b)-n:], x)
+		return append(b, '"'), nil
 	case bool:
 		return strconv.AppendBool(b, x), nil
 	case int:

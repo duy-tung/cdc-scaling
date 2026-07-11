@@ -7,11 +7,24 @@ import (
 	"github.com/go-mysql-org/go-mysql/client"
 )
 
+// ColumnKind classifies how a column's []byte binlog value must be
+// interpreted. The binlog does not distinguish TEXT from BLOB (both are
+// MYSQL_TYPE_BLOB), so information_schema's DATA_TYPE is the only way to
+// map values type-faithfully.
+type ColumnKind uint8
+
+const (
+	KindText   ColumnKind = iota // character data: emit as string
+	KindBinary                   // raw bytes: emit as base64
+	KindJSON                     // JSON document: emit as nested JSON
+)
+
 // TableSchema holds the column layout of one table, used by the
 // EventMapper to map positional binlog row values to named columns.
 type TableSchema struct {
-	Columns []string // in ordinal position order
-	PK      []string // primary key column names, in key order
+	Columns []string     // in ordinal position order
+	Kinds   []ColumnKind // parallel to Columns
+	PK      []string     // primary key column names, in key order
 }
 
 // schemaRegistry lazily loads table schemas from information_schema over a
@@ -87,7 +100,7 @@ func (r *schemaRegistry) InvalidateAll() {
 
 func (r *schemaRegistry) load(db, table string) (*TableSchema, error) {
 	res, err := r.query(
-		`SELECT COLUMN_NAME, COLUMN_KEY FROM information_schema.COLUMNS
+		`SELECT COLUMN_NAME, COLUMN_KEY, DATA_TYPE FROM information_schema.COLUMNS
 		 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`, db, table)
 	if err != nil {
 		return nil, fmt.Errorf("schema registry: load %s.%s: %w", db, table, err)
@@ -100,7 +113,9 @@ func (r *schemaRegistry) load(db, table string) (*TableSchema, error) {
 			return nil, err
 		}
 		key, _ := res.GetString(i, 1)
+		dataType, _ := res.GetString(i, 2)
 		s.Columns = append(s.Columns, name)
+		s.Kinds = append(s.Kinds, kindOf(dataType))
 		if key == "PRI" {
 			s.PK = append(s.PK, name)
 		}
@@ -109,6 +124,21 @@ func (r *schemaRegistry) load(db, table string) (*TableSchema, error) {
 		return nil, fmt.Errorf("schema registry: table %s.%s not found", db, table)
 	}
 	return s, nil
+}
+
+func kindOf(dataType string) ColumnKind {
+	switch dataType {
+	case "json":
+		return KindJSON
+	case "blob", "tinyblob", "mediumblob", "longblob",
+		"binary", "varbinary", "bit",
+		"geometry", "point", "linestring", "polygon",
+		"multipoint", "multilinestring", "multipolygon",
+		"geomcollection", "geometrycollection", "vector":
+		return KindBinary
+	default:
+		return KindText
+	}
 }
 
 func (r *schemaRegistry) query(q string, args ...any) (*mysqlResult, error) {
